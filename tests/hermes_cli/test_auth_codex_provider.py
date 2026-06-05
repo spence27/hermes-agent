@@ -16,6 +16,7 @@ from hermes_cli.auth import (
     _save_codex_tokens,
     _import_codex_cli_tokens,
     _login_openai_codex,
+    get_codex_auth_status,
     refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
     resolve_provider,
@@ -231,6 +232,48 @@ def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
 
     assert data["tokens"]["access_token"] == "at123"
     assert data["tokens"]["refresh_token"] == "rt456"
+
+
+def test_save_codex_tokens_exposes_profile_metadata_in_status(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    access_token = _jwt_with_exp(int(time.time()) + 3600)
+
+    _save_codex_tokens(
+        {"access_token": access_token, "refresh_token": "rt456"},
+        profile_ref="hermes-profile:settings",
+        profile_group_key="settings-ai-connection",
+        runtime_session_ref="settings-runtime-session",
+    )
+
+    status = get_codex_auth_status()
+    assert status["logged_in"] is True
+    assert status["profile_ref"] == "hermes-profile:settings"
+    assert status["profile_group_key"] == "settings-ai-connection"
+    assert status["runtime_session_ref"] == "settings-runtime-session"
+
+
+def test_save_codex_tokens_can_clear_profile_metadata(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    access_token = _jwt_with_exp(int(time.time()) + 3600)
+
+    _save_codex_tokens(
+        {"access_token": access_token, "refresh_token": "rt456"},
+        profile_ref="hermes-profile:settings",
+        profile_group_key="settings-ai-connection",
+        runtime_session_ref="settings-runtime-session",
+    )
+    _save_codex_tokens(
+        {"access_token": access_token, "refresh_token": "rt789"},
+        clear_profile_metadata=True,
+    )
+
+    status = get_codex_auth_status()
+    assert status["logged_in"] is True
+    assert "profile_ref" not in status
+    assert "profile_group_key" not in status
+    assert "runtime_session_ref" not in status
 
 
 def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
@@ -642,10 +685,11 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
         },
     )
 
-    def _fake_save(tokens, last_refresh=None):
+    def _fake_save(tokens, last_refresh=None, **kwargs):
         called["device_login"] += 1
         called["tokens"] = dict(tokens)
         called["last_refresh"] = last_refresh
+        called["save_kwargs"] = dict(kwargs)
 
     monkeypatch.setattr("hermes_cli.auth._save_codex_tokens", _fake_save)
     monkeypatch.setattr("hermes_cli.auth._update_config_for_provider", lambda *args, **kwargs: "/tmp/config.yaml")
@@ -658,3 +702,4 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
 
     assert called["device_login"] == 1
     assert called["tokens"]["access_token"] == "fresh-at"
+    assert called["save_kwargs"]["clear_profile_metadata"] is True

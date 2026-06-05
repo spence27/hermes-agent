@@ -17,6 +17,8 @@ binds.
 from __future__ import annotations
 
 import logging
+import hmac
+import os
 from typing import Awaitable, Callable
 
 from fastapi import Request
@@ -26,7 +28,10 @@ from hermes_cli.dashboard_auth import list_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
 from hermes_cli.dashboard_auth.cookies import read_session_cookies
-from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+from hermes_cli.dashboard_auth.public_paths import (
+    PUBLIC_API_PATHS,
+    path_allows_oauth_server_key,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -68,6 +73,20 @@ def _path_is_public(path: str) -> bool:
         path == prefix or path.startswith(prefix)
         for prefix in _GATE_PUBLIC_PREFIXES
     )
+
+
+def _has_valid_oauth_server_key(request: Request) -> bool:
+    if not path_allows_oauth_server_key(request.url.path):
+        return False
+    auth = request.headers.get("authorization", "")
+    for key_name in ("HERMES_API_SERVER_KEY", "API_SERVER_KEY"):
+        server_key = os.environ.get(key_name, "")
+        if server_key and hmac.compare_digest(
+            auth.encode(),
+            f"Bearer {server_key}".encode(),
+        ):
+            return True
+    return False
 
 
 def _client_ip(request: Request) -> str:
@@ -182,6 +201,8 @@ async def gated_auth_middleware(
 
     path = request.url.path
     if _path_is_public(path):
+        return await call_next(request)
+    if _has_valid_oauth_server_key(request):
         return await call_next(request)
 
     at, _rt = read_session_cookies(request)
@@ -341,4 +362,3 @@ def _attempt_refresh(request: Request, *, refresh_token):
         if new_session is not None:
             return new_session, provider.name
     return None
-

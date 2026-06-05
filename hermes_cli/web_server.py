@@ -170,6 +170,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 from hermes_cli.dashboard_auth.public_paths import (
     PUBLIC_API_PATHS as _PUBLIC_API_PATHS,
+    path_allows_oauth_server_key as _path_allows_oauth_server_key,
 )
 
 
@@ -190,7 +191,19 @@ def _has_valid_session_token(request: Request) -> bool:
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    if hmac.compare_digest(auth.encode(), expected.encode()):
+        return True
+
+    if _path_allows_oauth_server_key(request.url.path):
+        for key_name in ("HERMES_API_SERVER_KEY", "API_SERVER_KEY"):
+            server_key = os.environ.get(key_name, "")
+            if server_key and hmac.compare_digest(
+                auth.encode(),
+                f"Bearer {server_key}".encode(),
+            ):
+                return True
+
+    return False
 
 
 def _require_token(request: Request) -> None:
@@ -3057,7 +3070,7 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
 
 
 @app.get("/api/providers/oauth")
-async def list_oauth_providers():
+async def list_oauth_providers(request: Request):
     """Enumerate every OAuth-capable LLM provider with current status.
 
     Response shape (per provider):
@@ -3074,17 +3087,23 @@ async def list_oauth_providers():
           expires_at       ISO timestamp string or null
           has_refresh_token bool
     """
+    profile_context = _oauth_profile_context_from_headers(request)
     providers = []
     for p in _OAUTH_PROVIDER_CATALOG:
         status = _resolve_provider_status(p["id"], p.get("status_fn"))
-        providers.append({
+        status = _scope_oauth_provider_status(p["id"], status, profile_context)
+        provider = {
             "id": p["id"],
             "name": p["name"],
             "flow": p["flow"],
             "cli_command": p["cli_command"],
             "docs_url": p["docs_url"],
             "status": status,
-        })
+        }
+        profile_echo = _oauth_profile_echo(status)
+        if p["id"] == "openai-codex" and profile_echo:
+            provider.update(profile_echo)
+        providers.append(provider)
     return {"providers": providers}
 
 
@@ -3183,6 +3202,9 @@ async def disconnect_oauth_provider(provider_id: str, request: Request):
 _OAUTH_SESSION_TTL_SECONDS = 15 * 60
 _oauth_sessions: Dict[str, Dict[str, Any]] = {}
 _oauth_sessions_lock = threading.Lock()
+_ASQEND_PROFILE_REF_HEADER = "x-asqend-hermes-profile-ref"
+_ASQEND_PROFILE_GROUP_KEY_HEADER = "x-asqend-hermes-profile-group-key"
+_ASQEND_RUNTIME_SESSION_REF_HEADER = "x-asqend-hermes-runtime-session-ref"
 
 # Import OAuth constants from canonical source instead of duplicating.
 # Guarded so hermes web still starts if anthropic_adapter is unavailable;
@@ -3210,7 +3232,11 @@ def _gc_oauth_sessions() -> None:
             _oauth_sessions.pop(sid, None)
 
 
-def _new_oauth_session(provider_id: str, flow: str) -> tuple[str, Dict[str, Any]]:
+def _new_oauth_session(
+    provider_id: str,
+    flow: str,
+    profile_context: Optional[Dict[str, str]] = None,
+) -> tuple[str, Dict[str, Any]]:
     """Create + register a new OAuth session, return (session_id, session_dict)."""
     sid = secrets.token_urlsafe(16)
     sess = {
@@ -3221,9 +3247,184 @@ def _new_oauth_session(provider_id: str, flow: str) -> tuple[str, Dict[str, Any]
         "status": "pending",  # pending | approved | denied | expired | error
         "error_message": None,
     }
+    _apply_oauth_profile_context(sess, profile_context)
     with _oauth_sessions_lock:
         _oauth_sessions[sid] = sess
     return sid, sess
+
+
+def _clean_oauth_profile_value(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _first_clean_oauth_profile_value(
+    value: Dict[str, Any],
+    keys: tuple[str, ...],
+) -> Optional[str]:
+    for key in keys:
+        cleaned = _clean_oauth_profile_value(value.get(key))
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _oauth_profile_context_from_mapping(
+    value: Any,
+    *,
+    ref_keys: tuple[str, ...],
+    group_keys: tuple[str, ...],
+    runtime_keys: tuple[str, ...],
+) -> Optional[Dict[str, str]]:
+    if not isinstance(value, dict):
+        return None
+    profile_ref = _first_clean_oauth_profile_value(value, ref_keys)
+    profile_group_key = _first_clean_oauth_profile_value(value, group_keys)
+    runtime_session_ref = _first_clean_oauth_profile_value(value, runtime_keys)
+    if not any((profile_ref, profile_group_key, runtime_session_ref)):
+        return None
+    if not profile_ref:
+        raise HTTPException(status_code=400, detail="Asqend profile context requires profile_ref")
+    result = {"profile_ref": profile_ref}
+    if profile_group_key:
+        result["profile_group_key"] = profile_group_key
+    if runtime_session_ref:
+        result["runtime_session_ref"] = runtime_session_ref
+    return result
+
+
+def _oauth_profile_context_from_headers(request: Request) -> Optional[Dict[str, str]]:
+    return _oauth_profile_context_from_mapping(
+        {
+            "profile_ref": request.headers.get(_ASQEND_PROFILE_REF_HEADER),
+            "profile_group_key": request.headers.get(_ASQEND_PROFILE_GROUP_KEY_HEADER),
+            "runtime_session_ref": request.headers.get(_ASQEND_RUNTIME_SESSION_REF_HEADER),
+        },
+        ref_keys=("profile_ref",),
+        group_keys=("profile_group_key",),
+        runtime_keys=("runtime_session_ref",),
+    )
+
+
+async def _oauth_profile_context_from_request(
+    request: Request,
+    *,
+    include_body: bool = False,
+) -> Optional[Dict[str, str]]:
+    header_context = _oauth_profile_context_from_headers(request)
+    body_context = None
+    if include_body:
+        try:
+            raw_body = await request.json()
+        except Exception:
+            raw_body = None
+        if isinstance(raw_body, dict):
+            body_context = _oauth_profile_context_from_mapping(
+                raw_body.get("profile"),
+                ref_keys=(
+                    "profileRef",
+                    "profile_ref",
+                    "runtimeProfileRef",
+                    "runtime_profile_ref",
+                ),
+                group_keys=("profileGroupKey", "profile_group_key"),
+                runtime_keys=("runtimeSessionRef", "runtime_session_ref"),
+            )
+    if header_context and body_context:
+        for key in ("profile_ref", "profile_group_key", "runtime_session_ref"):
+            header_value = header_context.get(key)
+            body_value = body_context.get(key)
+            if header_value and body_value and header_value != body_value:
+                raise HTTPException(status_code=400, detail="Asqend profile context mismatch")
+        merged = dict(body_context)
+        merged.update(header_context)
+        return merged
+    return header_context or body_context
+
+
+def _apply_oauth_profile_context(
+    sess: Dict[str, Any],
+    profile_context: Optional[Dict[str, str]],
+) -> None:
+    if not profile_context:
+        return
+    for key in ("profile_ref", "profile_group_key", "runtime_session_ref"):
+        value = profile_context.get(key)
+        if value:
+            sess[key] = value
+
+
+def _oauth_profile_echo(source: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not source:
+        return {}
+    profile_ref = _clean_oauth_profile_value(source.get("profile_ref"))
+    if not profile_ref:
+        return {}
+    echo = {"profile_ref": profile_ref}
+    profile_group_key = _clean_oauth_profile_value(source.get("profile_group_key"))
+    runtime_session_ref = _clean_oauth_profile_value(source.get("runtime_session_ref"))
+    if profile_group_key:
+        echo["profile_group_key"] = profile_group_key
+    if runtime_session_ref:
+        echo["runtime_session_ref"] = runtime_session_ref
+    return echo
+
+
+def _oauth_session_matches_profile(
+    sess: Dict[str, Any],
+    profile_context: Optional[Dict[str, str]],
+) -> bool:
+    if not profile_context:
+        return True
+    if not sess.get("profile_ref"):
+        return False
+    for key in ("profile_ref", "profile_group_key", "runtime_session_ref"):
+        requested = profile_context.get(key)
+        actual = _clean_oauth_profile_value(sess.get(key))
+        if requested and actual and requested != actual:
+            return False
+    return True
+
+
+def _scope_oauth_provider_status(
+    provider_id: str,
+    status: Dict[str, Any],
+    profile_context: Optional[Dict[str, str]],
+) -> Dict[str, Any]:
+    if provider_id != "openai-codex" or not profile_context:
+        return status
+    requested_echo = _oauth_profile_echo(profile_context)
+    if status.get("logged_in") is True:
+        if _oauth_session_matches_profile(status, profile_context):
+            return {**status, **_oauth_profile_echo(status)}
+        return {
+            "logged_in": False,
+            "source": status.get("source") or "openai_codex",
+            "source_label": status.get("source_label") or "OpenAI Codex",
+            "token_preview": None,
+            "expires_at": None,
+            "has_refresh_token": False,
+            "last_refresh": None,
+            "error": "codex_credentials_not_bound_to_requested_profile",
+            **requested_echo,
+        }
+    return {**status, **requested_echo}
+
+
+def _oauth_session_cancelled(session_id: str) -> bool:
+    with _oauth_sessions_lock:
+        return session_id not in _oauth_sessions
+
+
+def _claim_oauth_session_token_write(session_id: str) -> bool:
+    with _oauth_sessions_lock:
+        sess = _oauth_sessions.get(session_id)
+        if sess is None:
+            return False
+        sess["token_write_in_progress"] = True
+        return True
 
 
 def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
@@ -3386,7 +3587,10 @@ def _submit_anthropic_pkce(session_id: str, code_input: str) -> Dict[str, Any]:
     return {"ok": True, "status": "approved"}
 
 
-async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
+async def _start_device_code_flow(
+    provider_id: str,
+    profile_context: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Initiate a device-code flow (Nous, OpenAI Codex, or MiniMax).
 
     Calls the provider's device-auth endpoint via the existing CLI helpers,
@@ -3426,7 +3630,7 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
         device_data, effective_scope = await asyncio.get_running_loop().run_in_executor(
             None, _do_nous_device_request
         )
-        sid, sess = _new_oauth_session("nous", "device_code")
+        sid, sess = _new_oauth_session("nous", "device_code", profile_context)
         sess["device_code"] = str(device_data["device_code"])
         sess["interval"] = int(device_data["interval"])
         sess["expires_at"] = time.time() + int(device_data["expires_in"])
@@ -3443,11 +3647,12 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
             "verification_url": str(device_data["verification_uri_complete"]),
             "expires_in": int(device_data["expires_in"]),
             "poll_interval": int(device_data["interval"]),
+            **_oauth_profile_echo(sess),
         }
 
     if provider_id == "openai-codex":
         # Codex uses fixed OpenAI device-auth endpoints; reuse the helper.
-        sid, _ = _new_oauth_session("openai-codex", "device_code")
+        sid, _ = _new_oauth_session("openai-codex", "device_code", profile_context)
         # Use the helper but in a thread because it polls inline.
         # We can't extract just the start step without refactoring auth.py,
         # so we run the full helper in a worker and proxy the user_code +
@@ -3478,6 +3683,7 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
             "verification_url": s["verification_url"],
             "expires_in": int(s.get("expires_in") or 900),
             "poll_interval": int(s.get("interval") or 5),
+            **_oauth_profile_echo(s),
         }
 
     if provider_id == "minimax-oauth":
@@ -3514,7 +3720,7 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
         device_data = await asyncio.get_event_loop().run_in_executor(
             None, _do_minimax_request
         )
-        sid, sess = _new_oauth_session("minimax-oauth", "device_code")
+        sid, sess = _new_oauth_session("minimax-oauth", "device_code", profile_context)
         # The CLI flow names this `interval_ms` because MiniMax's
         # `interval` field is in milliseconds (defensive default 2000ms
         # in _minimax_poll_token).
@@ -3554,6 +3760,7 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
             "verification_url": str(device_data["verification_uri"]),
             "expires_in": expires_in_seconds,
             "poll_interval": max(2, (sess["interval_ms"] or 2000) // 1000),
+            **_oauth_profile_echo(sess),
         }
 
     raise HTTPException(status_code=400, detail=f"Provider {provider_id} does not support device-code flow")
@@ -3975,7 +4182,11 @@ def _codex_full_login_worker(session_id: str) -> None:
         code_resp = None
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
             while time.monotonic() < deadline:
+                if _oauth_session_cancelled(session_id):
+                    return
                 time.sleep(poll_interval)
+                if _oauth_session_cancelled(session_id):
+                    return
                 poll = client.post(
                     f"{issuer}/api/accounts/deviceauth/token",
                     json={"device_auth_id": device_auth_id, "user_code": user_code},
@@ -3988,10 +4199,14 @@ def _codex_full_login_worker(session_id: str) -> None:
                     continue  # user hasn't authorized yet
                 raise RuntimeError(f"deviceauth/token poll returned {poll.status_code}")
 
+        if _oauth_session_cancelled(session_id):
+            return
         if code_resp is None:
             with _oauth_sessions_lock:
-                sess["status"] = "expired"
-                sess["error_message"] = "Device code expired before approval"
+                s = _oauth_sessions.get(session_id)
+                if s is not None:
+                    s["status"] = "expired"
+                    s["error_message"] = "Device code expired before approval"
             return
 
         # Step 3: exchange authorization_code for tokens
@@ -3999,6 +4214,8 @@ def _codex_full_login_worker(session_id: str) -> None:
         code_verifier = code_resp.get("code_verifier", "")
         if not authorization_code or not code_verifier:
             raise RuntimeError("device-auth response missing authorization_code/code_verifier")
+        if _oauth_session_cancelled(session_id):
+            return
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
             token_resp = client.post(
                 CODEX_OAUTH_TOKEN_URL,
@@ -4018,15 +4235,24 @@ def _codex_full_login_worker(session_id: str) -> None:
         refresh_token = tokens.get("refresh_token", "")
         if not access_token:
             raise RuntimeError("token exchange did not return access_token")
+        if not _claim_oauth_session_token_write(session_id):
+            return
 
         from hermes_cli.auth import _save_codex_tokens
 
-        _save_codex_tokens({
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-        })
+        _save_codex_tokens(
+            {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            },
+            profile_ref=sess.get("profile_ref"),
+            profile_group_key=sess.get("profile_group_key"),
+            runtime_session_ref=sess.get("runtime_session_ref"),
+        )
         with _oauth_sessions_lock:
-            sess["status"] = "approved"
+            s = _oauth_sessions.get(session_id)
+            if s is not None:
+                s["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
     except Exception as e:
         _log.warning("codex device-code worker failed (session=%s): %s", session_id, e)
@@ -4042,6 +4268,10 @@ async def start_oauth_login(provider_id: str, request: Request):
     """Initiate an OAuth login flow. Token-protected."""
     _require_token(request)
     _gc_oauth_sessions()
+    profile_context = await _oauth_profile_context_from_request(
+        request,
+        include_body=True,
+    )
     valid = {p["id"] for p in _OAUTH_PROVIDER_CATALOG}
     if provider_id not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown provider {provider_id}")
@@ -4061,7 +4291,7 @@ async def start_oauth_login(provider_id: str, request: Request):
         if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
             return _start_anthropic_pkce()
         if catalog_entry["flow"] == "device_code":
-            return await _start_device_code_flow(provider_id)
+            return await _start_device_code_flow(provider_id, profile_context)
         if catalog_entry["flow"] == "loopback" and provider_id == "xai-oauth":
             return await asyncio.get_running_loop().run_in_executor(
                 None, _start_xai_loopback_flow
@@ -4091,7 +4321,7 @@ async def submit_oauth_code(provider_id: str, body: OAuthSubmitBody, request: Re
 
 
 @app.get("/api/providers/oauth/{provider_id}/poll/{session_id}")
-async def poll_oauth_session(provider_id: str, session_id: str):
+async def poll_oauth_session(provider_id: str, session_id: str, request: Request):
     """Poll a session's status (no auth — read-only state).
 
     Shared by the device-code flows (Nous, OpenAI Codex, MiniMax) and the
@@ -4105,11 +4335,15 @@ async def poll_oauth_session(provider_id: str, session_id: str):
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if sess["provider"] != provider_id:
         raise HTTPException(status_code=400, detail="Provider mismatch for session")
+    profile_context = _oauth_profile_context_from_headers(request)
+    if not _oauth_session_matches_profile(sess, profile_context):
+        raise HTTPException(status_code=404, detail="Session not found or expired")
     return {
         "session_id": session_id,
         "status": sess["status"],
         "error_message": sess.get("error_message"),
         "expires_at": sess.get("expires_at"),
+        **_oauth_profile_echo(sess),
     }
 
 
@@ -4117,10 +4351,22 @@ async def poll_oauth_session(provider_id: str, session_id: str):
 async def cancel_oauth_session(session_id: str, request: Request):
     """Cancel a pending OAuth session. Token-protected."""
     _require_token(request)
+    profile_context = _oauth_profile_context_from_headers(request)
     with _oauth_sessions_lock:
-        sess = _oauth_sessions.pop(session_id, None)
+        sess = _oauth_sessions.get(session_id)
+        if sess is not None and not _oauth_session_matches_profile(sess, profile_context):
+            raise HTTPException(status_code=404, detail="Session not found or expired")
+        if sess is not None:
+            sess = _oauth_sessions.pop(session_id, None)
     if sess is None:
         return {"ok": False, "message": "session not found"}
+    profile_echo = _oauth_profile_echo(sess)
+    codex_pending_cancel = (
+        sess.get("provider") == "openai-codex"
+        and sess.get("flow") == "device_code"
+        and sess.get("status") == "pending"
+    )
+    codex_token_write_in_progress = bool(sess.get("token_write_in_progress"))
     # Loopback sessions own a bound 127.0.0.1 callback server. Without an
     # explicit shutdown the worker would keep that port held until
     # _xai_wait_for_callback times out (up to 5 min). Free it immediately so
@@ -4148,7 +4394,18 @@ async def cancel_oauth_session(session_id: str, request: Request):
                 thread.join(timeout=1.0)
         except Exception:
             pass
-    return {"ok": True, "session_id": session_id}
+    result = {"ok": True, "session_id": session_id, **profile_echo}
+    if codex_pending_cancel and not codex_token_write_in_progress:
+        result.update(
+            {
+                "worker_cancelled": True,
+                "token_write_prevented": True,
+                "cancel_safety": "verified_no_write",
+            }
+        )
+    elif codex_pending_cancel:
+        result["cancel_safety"] = "unverified"
+    return result
 
 
 # ---------------------------------------------------------------------------

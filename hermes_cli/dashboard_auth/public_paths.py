@@ -47,3 +47,20 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
 })
+
+
+def path_allows_oauth_server_key(path: str) -> bool:
+    """True for OAuth provider routes callable by a server-to-server proxy.
+
+    These routes are sensitive and are not public. They may, however, be
+    called by a trusted host such as Asqend using the API server bearer key.
+    Keep the allowlist narrow: provider disconnect and unrelated dashboard
+    APIs must continue to require the normal dashboard session.
+    """
+    if path == "/api/providers/oauth":
+        return True
+    if path.startswith("/api/providers/oauth/sessions/"):
+        return True
+    if not path.startswith("/api/providers/oauth/"):
+        return False
+    return path.endswith("/start") or "/poll/" in path

@@ -3370,7 +3370,36 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
+def _codex_profile_metadata_from_state(state: Any) -> Dict[str, str]:
+    if not isinstance(state, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for key in ("profile_ref", "profile_group_key", "runtime_session_ref"):
+        value = state.get(key)
+        if isinstance(value, str) and value.strip():
+            result[key] = value.strip()
+    return result
+
+
+def _codex_profile_metadata() -> Dict[str, str]:
+    try:
+        auth_store = _load_auth_store()
+        return _codex_profile_metadata_from_state(
+            _load_provider_state(auth_store, "openai-codex")
+        )
+    except Exception:
+        return {}
+
+
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: str = None,
+    label: str = None,
+    profile_ref: str = None,
+    profile_group_key: str = None,
+    runtime_session_ref: str = None,
+    clear_profile_metadata: bool = False,
+) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -3382,6 +3411,17 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
+        profile_values = {
+            "profile_ref": profile_ref,
+            "profile_group_key": profile_group_key,
+            "runtime_session_ref": runtime_session_ref,
+        }
+        if clear_profile_metadata:
+            for key in profile_values:
+                state.pop(key, None)
+        for key, value in profile_values.items():
+            if isinstance(value, str) and value.strip():
+                state[key] = value.strip()
         _save_provider_state(auth_store, "openai-codex", state)
         _sync_codex_pool_entries(auth_store, tokens, last_refresh)
         _save_auth_store(auth_store)
@@ -5556,6 +5596,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
     Checks the credential pool first (where `hermes auth` stores credentials),
     then falls back to the legacy provider state.
     """
+    profile_metadata = _codex_profile_metadata()
     # Check credential pool first — this is where `hermes auth` and
     # `hermes model` store device_code tokens.
     try:
@@ -5576,6 +5617,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
                         "auth_mode": "chatgpt",
                         "source": f"pool:{getattr(entry, 'label', 'unknown')}",
                         "api_key": api_key,
+                        **profile_metadata,
                     }
     except Exception:
         pass
@@ -5590,6 +5632,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
             "auth_mode": creds.get("auth_mode"),
             "source": creds.get("source"),
             "api_key": creds.get("api_key"),
+            **profile_metadata,
         }
     except AuthError as exc:
         return {
@@ -6296,7 +6339,7 @@ def _login_openai_codex(
             except (EOFError, KeyboardInterrupt):
                 do_import = "n"
             if do_import in {"y", "yes"}:
-                _save_codex_tokens(cli_tokens)
+                _save_codex_tokens(cli_tokens, clear_profile_metadata=True)
                 base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
                 print()
@@ -6314,7 +6357,11 @@ def _login_openai_codex(
     creds = _codex_device_code_login()
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+    _save_codex_tokens(
+        creds["tokens"],
+        creds.get("last_refresh"),
+        clear_profile_metadata=True,
+    )
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")

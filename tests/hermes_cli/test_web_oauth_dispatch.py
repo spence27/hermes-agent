@@ -32,6 +32,31 @@ from hermes_cli.web_server import _SESSION_TOKEN, app
 
 client = TestClient(app)
 HEADERS = {"X-Hermes-Session-Token": _SESSION_TOKEN}
+ASQEND_PROFILE_HEADERS = {
+    **HEADERS,
+    "x-asqend-hermes-profile-ref": "hermes-profile:settings",
+    "x-asqend-hermes-profile-group-key": "settings-ai-connection",
+    "x-asqend-hermes-runtime-session-ref": "settings-runtime-session",
+}
+ASQEND_SERVER_KEY_PROFILE_HEADERS = {
+    "authorization": "Bearer asqend-server-key",
+    "x-asqend-hermes-profile-ref": "hermes-profile:settings",
+    "x-asqend-hermes-profile-group-key": "settings-ai-connection",
+    "x-asqend-hermes-runtime-session-ref": "settings-runtime-session",
+}
+ASQEND_PROFILE_PAYLOAD = {
+    "contractVersion": "2026-06-04.hosted-codex-oauth",
+    "profileRef": "hermes-profile:settings",
+    "profileGroupKey": "settings-ai-connection",
+    "runtimeSessionRef": "settings-runtime-session",
+    "credentialMode": "spike_local_codex_subscription",
+    "modelProfileRef": None,
+    "isolation": {
+        "unit": "dedicated_vm",
+        "hostRef": "hermes-host",
+        "wholeProcessWrapped": False,
+    },
+}
 
 
 def _fake_nous_device_data():
@@ -335,6 +360,339 @@ def test_xai_oauth_listed_as_loopback_flow():
     assert "xai-oauth" in providers
     assert providers["xai-oauth"]["flow"] == "loopback"
     assert "grok" in providers["xai-oauth"]["name"].lower()
+
+
+def test_oauth_provider_paths_accept_asqend_server_key_without_dashboard_token(monkeypatch):
+    """Asqend uses the API server bearer, not the dashboard session header."""
+    from hermes_cli import web_server as ws
+
+    monkeypatch.setenv("HERMES_API_SERVER_KEY", "asqend-server-key")
+    resp = client.get("/api/providers/oauth", headers=ASQEND_SERVER_KEY_PROFILE_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    blocked = client.post(
+        "/api/env/reveal",
+        headers={"authorization": "Bearer asqend-server-key"},
+        json={"key": "SHOULD_NOT_REVEAL"},
+    )
+    assert blocked.status_code == 401
+
+    previous_auth_required = getattr(ws.app.state, "auth_required", None)
+    ws.app.state.auth_required = True
+    try:
+        hosted_resp = client.get(
+            "/api/providers/oauth",
+            headers=ASQEND_SERVER_KEY_PROFILE_HEADERS,
+        )
+        assert hosted_resp.status_code == 200, hosted_resp.text
+    finally:
+        ws.app.state.auth_required = previous_auth_required
+
+
+def test_codex_oauth_status_echoes_asqend_profile_scope():
+    """Hosted Asqend callers need profile proof, not process-global status."""
+    resp = client.get("/api/providers/oauth", headers=ASQEND_PROFILE_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    providers = {p["id"]: p for p in resp.json()["providers"]}
+    codex = providers["openai-codex"]
+    assert codex["profile_ref"] == "hermes-profile:settings"
+    assert codex["profile_group_key"] == "settings-ai-connection"
+    assert codex["runtime_session_ref"] == "settings-runtime-session"
+    assert codex["status"]["profile_ref"] == "hermes-profile:settings"
+    assert codex["status"]["runtime_session_ref"] == "settings-runtime-session"
+
+
+def test_codex_oauth_status_does_not_launder_mismatched_profile(monkeypatch):
+    """Global/profile-A Codex auth must not unlock Asqend profile B."""
+    from hermes_cli import auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "get_codex_auth_status",
+        lambda: {
+            "logged_in": True,
+            "source": "pool:device_code",
+            "source_label": "chatgpt",
+            "token_preview": "secret-preview",
+            "last_refresh": "2026-06-04T20:00:00Z",
+            "profile_ref": "hermes-profile:other",
+            "profile_group_key": "other-profile",
+            "runtime_session_ref": "other-runtime-session",
+        },
+    )
+
+    resp = client.get("/api/providers/oauth", headers=ASQEND_PROFILE_HEADERS)
+    assert resp.status_code == 200, resp.text
+    providers = {p["id"]: p for p in resp.json()["providers"]}
+    codex = providers["openai-codex"]
+    assert codex["profile_ref"] == "hermes-profile:settings"
+    assert codex["status"]["profile_ref"] == "hermes-profile:settings"
+    assert codex["status"]["logged_in"] is False
+    assert codex["status"]["token_preview"] is None
+    assert codex["status"]["last_refresh"] is None
+    assert codex["status"]["error"] == "codex_credentials_not_bound_to_requested_profile"
+
+
+def test_codex_oauth_start_binds_and_echoes_asqend_profile(monkeypatch):
+    """Start must bind the session to the Asqend runtime profile it was issued for."""
+    from hermes_cli import web_server as ws
+
+    def _fake_codex_worker(session_id):
+        with ws._oauth_sessions_lock:
+            sess = ws._oauth_sessions[session_id]
+            sess["user_code"] = "CODEX-1234"
+            sess["verification_url"] = "https://auth.openai.com/codex/device"
+            sess["device_auth_id"] = "device-auth-id"
+            sess["interval"] = 5
+            sess["expires_in"] = 900
+            sess["expires_at"] = time.time() + 900
+
+    monkeypatch.setattr(ws, "_codex_full_login_worker", _fake_codex_worker)
+
+    resp = client.post(
+        "/api/providers/oauth/openai-codex/start",
+        headers=ASQEND_PROFILE_HEADERS,
+        json={"profile": ASQEND_PROFILE_PAYLOAD},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    try:
+        assert body["profile_ref"] == "hermes-profile:settings"
+        assert body["profile_group_key"] == "settings-ai-connection"
+        assert body["runtime_session_ref"] == "settings-runtime-session"
+
+        sess = ws._oauth_sessions[body["session_id"]]
+        assert sess["profile_ref"] == "hermes-profile:settings"
+        assert sess["profile_group_key"] == "settings-ai-connection"
+        assert sess["runtime_session_ref"] == "settings-runtime-session"
+    finally:
+        ws._oauth_sessions.pop(body.get("session_id"), None)
+
+
+def test_codex_oauth_start_without_asqend_profile_remains_local_dashboard_compatible(monkeypatch):
+    """Local dashboard starts should keep their existing unscoped response shape."""
+    from hermes_cli import web_server as ws
+
+    def _fake_codex_worker(session_id):
+        with ws._oauth_sessions_lock:
+            sess = ws._oauth_sessions[session_id]
+            sess["user_code"] = "CODEX-LOCAL"
+            sess["verification_url"] = "https://auth.openai.com/codex/device"
+            sess["device_auth_id"] = "device-auth-id"
+            sess["interval"] = 5
+            sess["expires_in"] = 900
+            sess["expires_at"] = time.time() + 900
+
+    monkeypatch.setattr(ws, "_codex_full_login_worker", _fake_codex_worker)
+
+    resp = client.post("/api/providers/oauth/openai-codex/start", headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    try:
+        assert body["flow"] == "device_code"
+        assert body["user_code"] == "CODEX-LOCAL"
+        assert "profile_ref" not in body
+        assert "runtime_session_ref" not in body
+    finally:
+        ws._oauth_sessions.pop(body.get("session_id"), None)
+
+
+def test_codex_oauth_poll_rejects_asqend_profile_mismatch():
+    """A session created for one Asqend profile must not be pollable by another."""
+    from hermes_cli import web_server as ws
+
+    session_id = "codex-profile-mismatch-test"
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "openai-codex",
+        "flow": "device_code",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+        "expires_at": time.time() + 900,
+        "profile_ref": "hermes-profile:settings",
+        "profile_group_key": "settings-ai-connection",
+        "runtime_session_ref": "settings-runtime-session",
+    }
+    try:
+        resp = client.get(
+            f"/api/providers/oauth/openai-codex/poll/{session_id}",
+            headers={
+                **ASQEND_PROFILE_HEADERS,
+                "x-asqend-hermes-profile-ref": "hermes-profile:other",
+            },
+        )
+        assert resp.status_code == 404, resp.text
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_codex_oauth_cancel_rejects_asqend_profile_mismatch():
+    """A caller from another profile must not be able to cancel this session."""
+    from hermes_cli import web_server as ws
+
+    session_id = "codex-cancel-profile-mismatch-test"
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "openai-codex",
+        "flow": "device_code",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+        "expires_at": time.time() + 900,
+        "profile_ref": "hermes-profile:settings",
+        "profile_group_key": "settings-ai-connection",
+        "runtime_session_ref": "settings-runtime-session",
+    }
+    try:
+        resp = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}",
+            headers={
+                **ASQEND_PROFILE_HEADERS,
+                "x-asqend-hermes-profile-ref": "hermes-profile:other",
+            },
+        )
+        assert resp.status_code == 404, resp.text
+        assert session_id in ws._oauth_sessions
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_codex_oauth_cancel_echoes_profile_and_verified_no_write():
+    """Cancelling a Codex device-code session must prove the worker cannot persist."""
+    from hermes_cli import web_server as ws
+
+    session_id = "codex-cancel-profile-test"
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "openai-codex",
+        "flow": "device_code",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+        "expires_at": time.time() + 900,
+        "profile_ref": "hermes-profile:settings",
+        "profile_group_key": "settings-ai-connection",
+        "runtime_session_ref": "settings-runtime-session",
+    }
+    try:
+        resp = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}",
+            headers=ASQEND_PROFILE_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["session_id"] == session_id
+        assert body["profile_ref"] == "hermes-profile:settings"
+        assert body["worker_cancelled"] is True
+        assert body["token_write_prevented"] is True
+        assert body["cancel_safety"] == "verified_no_write"
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_codex_oauth_cancel_is_unverified_after_token_write_claim():
+    """After the worker claims token persistence, cancel can no longer prove no-write."""
+    from hermes_cli import web_server as ws
+
+    session_id = "codex-cancel-write-claimed-test"
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "openai-codex",
+        "flow": "device_code",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+        "expires_at": time.time() + 900,
+        "profile_ref": "hermes-profile:settings",
+        "profile_group_key": "settings-ai-connection",
+        "runtime_session_ref": "settings-runtime-session",
+        "token_write_in_progress": True,
+    }
+    try:
+        resp = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}",
+            headers=ASQEND_PROFILE_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["session_id"] == session_id
+        assert body["profile_ref"] == "hermes-profile:settings"
+        assert body["cancel_safety"] == "unverified"
+        assert body.get("token_write_prevented") is not True
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_codex_worker_skips_persist_when_cancelled_after_token_exchange(monkeypatch):
+    """If cancel wins during token exchange, Codex tokens must never be saved."""
+    from hermes_cli import auth as auth_mod
+    from hermes_cli import web_server as ws
+
+    saved_tokens = []
+    session_id = "codex-worker-cancel-no-write-test"
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            if url.endswith("/deviceauth/usercode"):
+                return _Resp(200, {
+                    "device_auth_id": "device-auth-id",
+                    "interval": 3,
+                    "user_code": "CODEX-1234",
+                })
+            if url.endswith("/deviceauth/token"):
+                return _Resp(200, {
+                    "authorization_code": "authorization-code",
+                    "code_verifier": "code-verifier",
+                })
+            ws._oauth_sessions.pop(session_id, None)
+            return _Resp(200, {
+                "access_token": "codex-access",
+                "refresh_token": "codex-refresh",
+            })
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(ws.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        auth_mod,
+        "_save_codex_tokens",
+        lambda tokens, **kwargs: saved_tokens.append(dict(tokens)),
+    )
+
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "openai-codex",
+        "flow": "device_code",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+    }
+    try:
+        ws._codex_full_login_worker(session_id)
+        assert saved_tokens == []
+        assert session_id not in ws._oauth_sessions
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
 
 
 def test_xai_loopback_start_returns_authorize_url(monkeypatch):
