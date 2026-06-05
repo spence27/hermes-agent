@@ -3029,6 +3029,9 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "expires_at": None,
                 "has_refresh_token": False,
                 "last_refresh": raw.get("last_refresh"),
+                "profile_ref": raw.get("profile_ref"),
+                "profile_group_key": raw.get("profile_group_key"),
+                "runtime_session_ref": raw.get("runtime_session_ref"),
             }
         if provider_id == "qwen-oauth":
             raw = hauth.get_qwen_auth_status()
@@ -4187,11 +4190,14 @@ def _codex_full_login_worker(session_id: str) -> None:
                 time.sleep(poll_interval)
                 if _oauth_session_cancelled(session_id):
                     return
-                poll = client.post(
-                    f"{issuer}/api/accounts/deviceauth/token",
-                    json={"device_auth_id": device_auth_id, "user_code": user_code},
-                    headers={"Content-Type": "application/json"},
-                )
+                try:
+                    poll = client.post(
+                        f"{issuer}/api/accounts/deviceauth/token",
+                        json={"device_auth_id": device_auth_id, "user_code": user_code},
+                        headers={"Content-Type": "application/json"},
+                    )
+                except httpx.ReadTimeout:
+                    continue
                 if poll.status_code == 200:
                     code_resp = poll.json()
                     break

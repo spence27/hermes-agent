@@ -232,6 +232,68 @@ def test_codex_dashboard_worker_persists_runtime_provider(tmp_path, monkeypatch)
         ws._oauth_sessions.pop(sid, None)
 
 
+def test_codex_dashboard_worker_keeps_polling_after_openai_read_timeout(tmp_path, monkeypatch):
+    from hermes_cli import web_server as ws
+    from hermes_cli.auth import get_active_provider
+
+    access_token = "h.eyJleHAiOjk5OTk5OTk5OTl9.s"
+    token_poll_attempts = 0
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            nonlocal token_poll_attempts
+            if url.endswith("/deviceauth/usercode"):
+                return _Resp(200, {
+                    "device_auth_id": "device-auth-id",
+                    "interval": 3,
+                    "user_code": "CODEX-1234",
+                })
+            if url.endswith("/deviceauth/token"):
+                token_poll_attempts += 1
+                if token_poll_attempts == 1:
+                    raise httpx.ReadTimeout("The read operation timed out")
+                return _Resp(200, {
+                    "authorization_code": "authorization-code",
+                    "code_verifier": "code-verifier",
+                })
+            return _Resp(200, {
+                "access_token": access_token,
+                "refresh_token": "codex-refresh",
+            })
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(ws.time, "sleep", lambda _: None)
+
+    sid, _ = ws._new_oauth_session("openai-codex", "device_code")
+    try:
+        ws._codex_full_login_worker(sid)
+
+        assert token_poll_attempts == 2
+        assert ws._oauth_sessions[sid]["status"] == "approved"
+        assert ws._oauth_sessions[sid]["user_code"] == "CODEX-1234"
+        assert get_active_provider() == "openai-codex"
+    finally:
+        ws._oauth_sessions.pop(sid, None)
+
+
 def test_nous_dashboard_poller_preserves_effective_scope_when_token_omits_scope(monkeypatch):
     from hermes_cli import auth as auth_mod
     from hermes_cli import web_server as ws
@@ -432,6 +494,38 @@ def test_codex_oauth_status_does_not_launder_mismatched_profile(monkeypatch):
     assert codex["status"]["token_preview"] is None
     assert codex["status"]["last_refresh"] is None
     assert codex["status"]["error"] == "codex_credentials_not_bound_to_requested_profile"
+
+
+def test_codex_oauth_status_preserves_matching_logged_in_profile(monkeypatch):
+    """Logged-in Codex status must keep profile proof through the HTTP adapter."""
+    from hermes_cli import auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "get_codex_auth_status",
+        lambda: {
+            "logged_in": True,
+            "auth_mode": "chatgpt",
+            "source": "pool:device_code",
+            "api_key": "codex-access-token",
+            "last_refresh": "2026-06-04T20:00:00Z",
+            "profile_ref": "hermes-profile:settings",
+            "profile_group_key": "settings-ai-connection",
+            "runtime_session_ref": "settings-runtime-session",
+        },
+    )
+
+    resp = client.get("/api/providers/oauth", headers=ASQEND_PROFILE_HEADERS)
+    assert resp.status_code == 200, resp.text
+    providers = {p["id"]: p for p in resp.json()["providers"]}
+    codex = providers["openai-codex"]
+    assert codex["profile_ref"] == "hermes-profile:settings"
+    assert codex["status"]["logged_in"] is True
+    assert codex["status"]["last_refresh"] == "2026-06-04T20:00:00Z"
+    assert codex["status"]["profile_ref"] == "hermes-profile:settings"
+    assert codex["status"]["profile_group_key"] == "settings-ai-connection"
+    assert codex["status"]["runtime_session_ref"] == "settings-runtime-session"
+    assert "error" not in codex["status"]
 
 
 def test_codex_oauth_start_binds_and_echoes_asqend_profile(monkeypatch):
