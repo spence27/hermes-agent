@@ -421,6 +421,26 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def _create_identity_probe_app(api_mod, adapter) -> web.Application:
+    """Create a small app with the endpoint roles Asqend probes for identity."""
+    mws = [
+        mw
+        for mw in (
+            api_mod.cors_middleware,
+            api_mod.security_headers_middleware,
+        )
+        if mw is not None
+    ]
+    app = web.Application(middlewares=mws)
+    app["api_server_adapter"] = adapter
+    app.router.add_get("/health", adapter._handle_health)
+    app.router.add_get("/health/detailed", adapter._handle_health_detailed)
+    app.router.add_get("/api/sessions", adapter._handle_list_sessions)
+    app.router.add_post("/api/sessions", adapter._handle_create_session)
+    app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
+    return app
+
+
 @pytest.fixture
 def adapter():
     return _make_adapter()
@@ -498,6 +518,73 @@ class TestHealthEndpoint:
             assert data["platform"] == "hermes-agent"
 
     @pytest.mark.asyncio
+    async def test_health_echoes_process_start_asqend_identity(self, monkeypatch):
+        """Gateway health must expose the org/container identity configured at boot."""
+        import hermes_cli.asqend_identity as identity
+        from gateway.platforms import api_server as api_mod
+
+        monkeypatch.setattr(
+            identity,
+            "_BOOT_IDENTITY",
+            {
+                "org_id": "org-gateway-a",
+                "container_ref": "container-gateway-a",
+                "source": identity.ASQEND_IDENTITY_SOURCE,
+                "version": identity.ASQEND_IDENTITY_VERSION,
+            },
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        app = _create_identity_probe_app(api_mod, adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/health",
+                headers={
+                    "x-asqend-org-id": "org-gateway-a",
+                    "x-asqend-hermes-container-ref": "container-gateway-a",
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        echo = data["asqend_identity"]
+        assert echo["org_id"] == "org-gateway-a"
+        assert echo["container_ref"] == "container-gateway-a"
+        assert echo["surface"] == "gateway_health"
+        assert echo["source"] == "process_env"
+        assert echo["version"]
+
+    @pytest.mark.asyncio
+    async def test_health_rejects_mismatched_expected_asqend_identity(self, monkeypatch):
+        """Expected identity headers validate the process identity instead of overriding it."""
+        import hermes_cli.asqend_identity as identity
+        from gateway.platforms import api_server as api_mod
+
+        monkeypatch.setattr(
+            identity,
+            "_BOOT_IDENTITY",
+            {
+                "org_id": "org-gateway-a",
+                "container_ref": "container-gateway-a",
+                "source": identity.ASQEND_IDENTITY_SOURCE,
+                "version": identity.ASQEND_IDENTITY_VERSION,
+            },
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        app = _create_identity_probe_app(api_mod, adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/health",
+                headers={
+                    "x-asqend-org-id": "org-gateway-b",
+                    "x-asqend-hermes-container-ref": "container-gateway-a",
+                },
+            )
+
+        assert resp.status == 409
+
+    @pytest.mark.asyncio
     async def test_v1_health_alias_returns_ok(self, adapter):
         """GET /v1/health should return the same response as /health."""
         app = _create_app(adapter)
@@ -539,6 +626,34 @@ class TestHealthDetailedEndpoint:
                 assert "updated_at" in data
 
     @pytest.mark.asyncio
+    async def test_health_detailed_echoes_process_start_asqend_identity(self, monkeypatch):
+        import hermes_cli.asqend_identity as identity
+        from gateway.platforms import api_server as api_mod
+
+        monkeypatch.setattr(
+            identity,
+            "_BOOT_IDENTITY",
+            {
+                "org_id": "org-detailed-a",
+                "container_ref": "container-detailed-a",
+                "source": identity.ASQEND_IDENTITY_SOURCE,
+                "version": identity.ASQEND_IDENTITY_VERSION,
+            },
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        app = _create_identity_probe_app(api_mod, adapter)
+        with patch("gateway.status.read_runtime_status", return_value=None):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+
+        echo = data["asqend_identity"]
+        assert echo["org_id"] == "org-detailed-a"
+        assert echo["container_ref"] == "container-detailed-a"
+        assert echo["surface"] == "gateway_health_detailed"
+
+    @pytest.mark.asyncio
     async def test_health_detailed_no_runtime_status(self, adapter):
         """When gateway_state.json is missing, fields are None."""
         app = _create_app(adapter)
@@ -559,6 +674,78 @@ class TestHealthDetailedEndpoint:
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# /api/sessions identity echo
+# ---------------------------------------------------------------------------
+
+
+class TestSessionIdentityEndpoint:
+    @pytest.mark.asyncio
+    async def test_session_routes_echo_process_start_asqend_identity(self, monkeypatch):
+        import hermes_cli.asqend_identity as identity
+        from gateway.platforms import api_server as api_mod
+
+        class _FakeDB:
+            def __init__(self):
+                self.sessions = {
+                    "existing-session": {
+                        "id": "existing-session",
+                        "source": "api_server",
+                        "model": "hermes-agent",
+                        "started_at": 1,
+                        "last_active": 1,
+                    }
+                }
+
+            def list_sessions_rich(self, **kwargs):
+                return list(self.sessions.values())
+
+            def get_session(self, session_id):
+                return self.sessions.get(session_id)
+
+            def create_session(self, session_id, source, model=None, system_prompt=None):
+                self.sessions[session_id] = {
+                    "id": session_id,
+                    "source": source,
+                    "model": model,
+                    "started_at": 2,
+                    "last_active": 2,
+                }
+
+        monkeypatch.setattr(
+            identity,
+            "_BOOT_IDENTITY",
+            {
+                "org_id": "org-session-a",
+                "container_ref": "container-session-a",
+                "source": identity.ASQEND_IDENTITY_SOURCE,
+                "version": identity.ASQEND_IDENTITY_VERSION,
+            },
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._session_db = _FakeDB()
+        app = _create_identity_probe_app(api_mod, adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            listed = await cli.get("/api/sessions")
+            assert listed.status == 200
+            listed_body = await listed.json()
+            assert listed_body["asqend_identity"]["surface"] == "gateway_sessions_list"
+            assert listed_body["asqend_identity"]["container_ref"] == "container-session-a"
+
+            created = await cli.post("/api/sessions", json={"id": "created-session"})
+            assert created.status == 201
+            created_body = await created.json()
+            assert created_body["asqend_identity"]["surface"] == "gateway_sessions_create"
+            assert created_body["asqend_identity"]["org_id"] == "org-session-a"
+
+            fetched = await cli.get("/api/sessions/created-session")
+            assert fetched.status == 200
+            fetched_body = await fetched.json()
+            assert fetched_body["asqend_identity"]["surface"] == "gateway_sessions_get"
+            assert fetched_body["asqend_identity"]["container_ref"] == "container-session-a"
 
 
 # ---------------------------------------------------------------------------

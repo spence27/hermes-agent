@@ -56,6 +56,11 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
     redact_key,
 )
+from hermes_cli.asqend_identity import (
+    AsqendIdentityMismatch,
+    validate_expected_asqend_identity,
+    with_asqend_identity,
+)
 from gateway.status import get_running_pid, read_runtime_status
 from utils import env_var_enabled
 
@@ -210,6 +215,16 @@ def _require_token(request: Request) -> None:
     """Validate the ephemeral session token.  Raises 401 on mismatch."""
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _require_expected_asqend_identity(request: Request) -> None:
+    try:
+        validate_expected_asqend_identity(request.headers)
+    except AsqendIdentityMismatch as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
 
 
 # Accepted Host header values for loopback binds. DNS rebinding attacks
@@ -684,7 +699,8 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
 
 
 @app.get("/api/status")
-async def get_status():
+async def get_status(request: Request):
+    _require_expected_asqend_identity(request)
     current_ver, latest_ver = check_config_version()
 
     # --- Gateway liveness detection ---
@@ -783,7 +799,7 @@ async def get_status():
         # Module not importable yet (early startup) — leave as [].
         pass
 
-    return {
+    return with_asqend_identity({
         "version": __version__,
         "release_date": __release_date__,
         "hermes_home": str(get_hermes_home()),
@@ -801,7 +817,7 @@ async def get_status():
         "active_sessions": active_sessions,
         "auth_required": auth_required,
         "auth_providers": auth_providers,
-    }
+    }, "dashboard_status")
 
 
 @app.get("/api/system/stats")
@@ -1410,6 +1426,7 @@ async def get_action_status(name: str, lines: int = 200):
 
 @app.get("/api/sessions")
 async def get_sessions(
+    request: Request,
     limit: int = 20,
     offset: int = 0,
     min_messages: int = 0,
@@ -1428,6 +1445,7 @@ async def get_sessions(
     chain). ``recent`` keeps a long-running conversation on the first page
     after it auto-compresses into a fresh continuation id.
     """
+    _require_expected_asqend_identity(request)
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(
             status_code=400,
@@ -1466,7 +1484,10 @@ async def get_sessions(
                 )
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+            return with_asqend_identity(
+                {"sessions": sessions, "total": total, "limit": limit, "offset": offset},
+                "dashboard_sessions_list",
+            )
         finally:
             db.close()
     except Exception:
@@ -3090,6 +3111,7 @@ async def list_oauth_providers(request: Request):
           expires_at       ISO timestamp string or null
           has_refresh_token bool
     """
+    _require_expected_asqend_identity(request)
     profile_context = _oauth_profile_context_from_headers(request)
     providers = []
     for p in _OAUTH_PROVIDER_CATALOG:
@@ -3107,7 +3129,7 @@ async def list_oauth_providers(request: Request):
         if p["id"] == "openai-codex" and profile_echo:
             provider.update(profile_echo)
         providers.append(provider)
-    return {"providers": providers}
+    return with_asqend_identity({"providers": providers}, "dashboard_oauth")
 
 
 @app.delete("/api/providers/oauth/{provider_id}")
@@ -4273,6 +4295,7 @@ def _codex_full_login_worker(session_id: str) -> None:
 async def start_oauth_login(provider_id: str, request: Request):
     """Initiate an OAuth login flow. Token-protected."""
     _require_token(request)
+    _require_expected_asqend_identity(request)
     _gc_oauth_sessions()
     profile_context = await _oauth_profile_context_from_request(
         request,
@@ -4295,13 +4318,20 @@ async def start_oauth_login(provider_id: str, request: Request):
         # change for MiniMax). New PKCE providers must add their own
         # start function and an explicit branch here.
         if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
-            return _start_anthropic_pkce()
+            return with_asqend_identity(
+                _start_anthropic_pkce(),
+                "dashboard_oauth_start",
+            )
         if catalog_entry["flow"] == "device_code":
-            return await _start_device_code_flow(provider_id, profile_context)
+            return with_asqend_identity(
+                await _start_device_code_flow(provider_id, profile_context),
+                "dashboard_oauth_start",
+            )
         if catalog_entry["flow"] == "loopback" and provider_id == "xai-oauth":
-            return await asyncio.get_running_loop().run_in_executor(
+            result = await asyncio.get_running_loop().run_in_executor(
                 None, _start_xai_loopback_flow
             )
+            return with_asqend_identity(result, "dashboard_oauth_start")
     except HTTPException:
         raise
     except Exception as e:
@@ -4335,6 +4365,7 @@ async def poll_oauth_session(provider_id: str, session_id: str, request: Request
     background-worker-updated ``status`` field, so a single poll endpoint
     serves them all.
     """
+    _require_expected_asqend_identity(request)
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
     if not sess:
@@ -4344,19 +4375,23 @@ async def poll_oauth_session(provider_id: str, session_id: str, request: Request
     profile_context = _oauth_profile_context_from_headers(request)
     if not _oauth_session_matches_profile(sess, profile_context):
         raise HTTPException(status_code=404, detail="Session not found or expired")
-    return {
-        "session_id": session_id,
-        "status": sess["status"],
-        "error_message": sess.get("error_message"),
-        "expires_at": sess.get("expires_at"),
-        **_oauth_profile_echo(sess),
-    }
+    return with_asqend_identity(
+        {
+            "session_id": session_id,
+            "status": sess["status"],
+            "error_message": sess.get("error_message"),
+            "expires_at": sess.get("expires_at"),
+            **_oauth_profile_echo(sess),
+        },
+        "dashboard_oauth_poll",
+    )
 
 
 @app.delete("/api/providers/oauth/sessions/{session_id}")
 async def cancel_oauth_session(session_id: str, request: Request):
     """Cancel a pending OAuth session. Token-protected."""
     _require_token(request)
+    _require_expected_asqend_identity(request)
     profile_context = _oauth_profile_context_from_headers(request)
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
@@ -4365,7 +4400,10 @@ async def cancel_oauth_session(session_id: str, request: Request):
         if sess is not None:
             sess = _oauth_sessions.pop(session_id, None)
     if sess is None:
-        return {"ok": False, "message": "session not found"}
+        return with_asqend_identity(
+            {"ok": False, "message": "session not found"},
+            "dashboard_oauth_cancel",
+        )
     profile_echo = _oauth_profile_echo(sess)
     codex_pending_cancel = (
         sess.get("provider") == "openai-codex"
@@ -4411,7 +4449,7 @@ async def cancel_oauth_session(session_id: str, request: Request):
         )
     elif codex_pending_cancel:
         result["cancel_safety"] = "unverified"
-    return result
+    return with_asqend_identity(result, "dashboard_oauth_cancel")
 
 
 # ---------------------------------------------------------------------------

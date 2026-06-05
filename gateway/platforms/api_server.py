@@ -58,6 +58,11 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from hermes_cli.asqend_identity import (
+    AsqendIdentityMismatch,
+    validate_expected_asqend_identity,
+    with_asqend_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -866,6 +871,17 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _check_asqend_identity(self, request: "web.Request") -> Optional["web.Response"]:
+        """Validate expected Asqend identity headers without trusting them as identity."""
+        try:
+            validate_expected_asqend_identity(request.headers)
+        except AsqendIdentityMismatch as exc:
+            return web.json_response(
+                _openai_error(str(exc), code=exc.code),
+                status=409,
+            )
+        return None
+
     # ------------------------------------------------------------------
     # Session header helpers
     # ------------------------------------------------------------------
@@ -1022,7 +1038,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
-        return web.json_response({"status": "ok", "platform": "hermes-agent"})
+        identity_err = self._check_asqend_identity(request)
+        if identity_err:
+            return identity_err
+        return web.json_response(
+            with_asqend_identity(
+                {"status": "ok", "platform": "hermes-agent"},
+                "gateway_health",
+            )
+        )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
@@ -1033,17 +1057,26 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         from gateway.status import read_runtime_status
 
+        identity_err = self._check_asqend_identity(request)
+        if identity_err:
+            return identity_err
+
         runtime = read_runtime_status() or {}
-        return web.json_response({
-            "status": "ok",
-            "platform": "hermes-agent",
-            "gateway_state": runtime.get("gateway_state"),
-            "platforms": runtime.get("platforms", {}),
-            "active_agents": runtime.get("active_agents", 0),
-            "exit_reason": runtime.get("exit_reason"),
-            "updated_at": runtime.get("updated_at"),
-            "pid": os.getpid(),
-        })
+        return web.json_response(
+            with_asqend_identity(
+                {
+                    "status": "ok",
+                    "platform": "hermes-agent",
+                    "gateway_state": runtime.get("gateway_state"),
+                    "platforms": runtime.get("platforms", {}),
+                    "active_agents": runtime.get("active_agents", 0),
+                    "exit_reason": runtime.get("exit_reason"),
+                    "updated_at": runtime.get("updated_at"),
+                    "pid": os.getpid(),
+                },
+                "gateway_health_detailed",
+            )
+        )
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -1307,6 +1340,9 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        identity_err = self._check_asqend_identity(request)
+        if identity_err:
+            return identity_err
 
         db = self._ensure_session_db()
         if db is None:
@@ -1323,19 +1359,27 @@ class APIServerAdapter(BasePlatformAdapter):
             include_children=include_children,
             order_by_last_active=True,
         )
-        return web.json_response({
-            "object": "list",
-            "data": [self._session_response(s) for s in sessions],
-            "limit": limit,
-            "offset": offset,
-            "has_more": len(sessions) == limit,
-        })
+        return web.json_response(
+            with_asqend_identity(
+                {
+                    "object": "list",
+                    "data": [self._session_response(s) for s in sessions],
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": len(sessions) == limit,
+                },
+                "gateway_sessions_list",
+            )
+        )
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions — create an empty Hermes session row."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        identity_err = self._check_asqend_identity(request)
+        if identity_err:
+            return identity_err
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -1366,17 +1410,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 db.delete_session(session_id)
                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         session = db.get_session(session_id) or {"id": session_id, "source": "api_server", "model": model, "title": title}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
+        return web.json_response(
+            with_asqend_identity(
+                {"object": "hermes.session", "session": self._session_response(session)},
+                "gateway_sessions_create",
+            ),
+            status=201,
+        )
 
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        identity_err = self._check_asqend_identity(request)
+        if identity_err:
+            return identity_err
         session, err = self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        return web.json_response(
+            with_asqend_identity(
+                {"object": "hermes.session", "session": self._session_response(session)},
+                "gateway_sessions_get",
+            )
+        )
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""

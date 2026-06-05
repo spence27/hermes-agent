@@ -1,5 +1,6 @@
 """Tests for hermes_cli.web_server and related config utilities."""
 
+import importlib
 import os
 import json
 import shutil
@@ -242,6 +243,85 @@ class TestWebServerEndpoints:
         assert "version" in data
         assert "hermes_home" in data
         assert "active_sessions" in data
+
+    def test_get_status_echoes_process_start_asqend_identity(self, monkeypatch):
+        """Dashboard status must expose immutable org/container identity when configured."""
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+        import hermes_cli.asqend_identity as identity
+
+        monkeypatch.setattr(
+            identity,
+            "_BOOT_IDENTITY",
+            {
+                "org_id": "org-status-a",
+                "container_ref": "container-status-a",
+                "source": identity.ASQEND_IDENTITY_SOURCE,
+                "version": identity.ASQEND_IDENTITY_VERSION,
+            },
+        )
+        client = TestClient(ws.app)
+        client.headers[ws._SESSION_HEADER_NAME] = ws._SESSION_TOKEN
+
+        resp = client.get("/api/status")
+
+        assert resp.status_code == 200
+        echo = resp.json()["asqend_identity"]
+        assert echo["org_id"] == "org-status-a"
+        assert echo["container_ref"] == "container-status-a"
+        assert echo["surface"] == "dashboard_status"
+        assert echo["source"] == "process_env"
+        assert echo["version"]
+
+    def test_asqend_identity_headers_without_process_identity_are_rejected(self, monkeypatch):
+        """Request headers validate expected identity but must never become identity."""
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+
+        import hermes_cli.asqend_identity as identity
+        monkeypatch.setattr(identity, "_BOOT_IDENTITY", None)
+        client = TestClient(ws.app)
+
+        resp = client.get(
+            "/api/status",
+            headers={
+                ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN,
+                "x-asqend-org-id": "org-from-header",
+                "x-asqend-hermes-container-ref": "container-from-header",
+            },
+        )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["code"] == "asqend_identity_missing"
+
+    def test_dashboard_env_api_cannot_mutate_asqend_identity(self, monkeypatch):
+        """Org/container identity is boot configuration, not dashboard-editable env."""
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+        import hermes_cli.asqend_identity as identity
+
+        monkeypatch.setattr(
+            identity,
+            "_BOOT_IDENTITY",
+            {
+                "org_id": "org-boot",
+                "container_ref": "container-boot",
+                "source": identity.ASQEND_IDENTITY_SOURCE,
+                "version": identity.ASQEND_IDENTITY_VERSION,
+            },
+        )
+        client = TestClient(ws.app)
+        client.headers[ws._SESSION_HEADER_NAME] = ws._SESSION_TOKEN
+
+        resp = client.put(
+            "/api/env",
+            json={"key": "ASQEND_ORG_ID", "value": "org-mutated"},
+        )
+        assert resp.status_code == 400
+
+        status = client.get("/api/status")
+        assert status.status_code == 200
+        assert status.json()["asqend_identity"]["org_id"] == "org-boot"
 
     def test_get_sessions_uses_only_persisted_cwd(self, monkeypatch):
         """Session rows without persisted cwd must not inherit TERMINAL_CWD.
@@ -3647,4 +3727,3 @@ class TestValidateProviderCredential:
     def test_empty_value_rejected(self):
         data = self._post("OPENAI_API_KEY", "   ").json()
         assert data["ok"] is False
-

@@ -28,22 +28,33 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from hermes_cli.web_server import _SESSION_TOKEN, app
+from hermes_cli.web_server import app
 
 client = TestClient(app)
-HEADERS = {"X-Hermes-Session-Token": _SESSION_TOKEN}
-ASQEND_PROFILE_HEADERS = {
-    **HEADERS,
-    "x-asqend-hermes-profile-ref": "hermes-profile:settings",
-    "x-asqend-hermes-profile-group-key": "settings-ai-connection",
-    "x-asqend-hermes-runtime-session-ref": "settings-runtime-session",
-}
-ASQEND_SERVER_KEY_PROFILE_HEADERS = {
-    "authorization": "Bearer asqend-server-key",
-    "x-asqend-hermes-profile-ref": "hermes-profile:settings",
-    "x-asqend-hermes-profile-group-key": "settings-ai-connection",
-    "x-asqend-hermes-runtime-session-ref": "settings-runtime-session",
-}
+
+
+def _headers():
+    from hermes_cli import web_server as ws
+
+    return {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+
+def _asqend_profile_headers():
+    return {
+        **_headers(),
+        "x-asqend-hermes-profile-ref": "hermes-profile:settings",
+        "x-asqend-hermes-profile-group-key": "settings-ai-connection",
+        "x-asqend-hermes-runtime-session-ref": "settings-runtime-session",
+    }
+
+
+def _asqend_server_key_profile_headers():
+    return {
+        "authorization": "Bearer asqend-server-key",
+        "x-asqend-hermes-profile-ref": "hermes-profile:settings",
+        "x-asqend-hermes-profile-group-key": "settings-ai-connection",
+        "x-asqend-hermes-runtime-session-ref": "settings-runtime-session",
+    }
 ASQEND_PROFILE_PAYLOAD = {
     "contractVersion": "2026-06-04.hosted-codex-oauth",
     "profileRef": "hermes-profile:settings",
@@ -57,6 +68,31 @@ ASQEND_PROFILE_PAYLOAD = {
         "wholeProcessWrapped": False,
     },
 }
+
+
+def _reload_web_server_with_asqend_identity(monkeypatch):
+    from hermes_cli import web_server as ws
+    import hermes_cli.asqend_identity as identity
+
+    monkeypatch.setattr(
+        identity,
+        "_BOOT_IDENTITY",
+        {
+            "org_id": "org-oauth-a",
+            "container_ref": "container-oauth-a",
+            "source": identity.ASQEND_IDENTITY_SOURCE,
+            "version": identity.ASQEND_IDENTITY_VERSION,
+        },
+    )
+    local_client = TestClient(ws.app)
+    local_headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+    return ws, local_client, local_headers
+
+
+def _reset_web_server_without_asqend_identity(monkeypatch, ws):
+    import hermes_cli.asqend_identity as identity
+
+    monkeypatch.setattr(identity, "_BOOT_IDENTITY", None)
 
 
 def _fake_nous_device_data():
@@ -107,7 +143,7 @@ def test_minimax_login_does_not_launch_anthropic_flow():
     ):
         resp = client.post(
             "/api/providers/oauth/minimax-oauth/start",
-            headers=HEADERS,
+            headers=_headers(),
         )
 
     assert resp.status_code == 200, resp.text
@@ -405,7 +441,7 @@ def test_anthropic_pkce_branch_still_works():
     ):
         resp = client.post(
             "/api/providers/oauth/anthropic/start",
-            headers=HEADERS,
+            headers=_headers(),
         )
 
     assert resp.status_code == 200, resp.text
@@ -416,7 +452,7 @@ def test_anthropic_pkce_branch_still_works():
 
 def test_xai_oauth_listed_as_loopback_flow():
     """xAI Grok OAuth must surface in the catalog as a first-class loopback flow."""
-    resp = client.get("/api/providers/oauth", headers=HEADERS)
+    resp = client.get("/api/providers/oauth", headers=_headers())
     assert resp.status_code == 200, resp.text
     providers = {p["id"]: p for p in resp.json()["providers"]}
     assert "xai-oauth" in providers
@@ -429,7 +465,7 @@ def test_oauth_provider_paths_accept_asqend_server_key_without_dashboard_token(m
     from hermes_cli import web_server as ws
 
     monkeypatch.setenv("HERMES_API_SERVER_KEY", "asqend-server-key")
-    resp = client.get("/api/providers/oauth", headers=ASQEND_SERVER_KEY_PROFILE_HEADERS)
+    resp = client.get("/api/providers/oauth", headers=_asqend_server_key_profile_headers())
     assert resp.status_code == 200, resp.text
 
     blocked = client.post(
@@ -444,7 +480,7 @@ def test_oauth_provider_paths_accept_asqend_server_key_without_dashboard_token(m
     try:
         hosted_resp = client.get(
             "/api/providers/oauth",
-            headers=ASQEND_SERVER_KEY_PROFILE_HEADERS,
+            headers=_asqend_server_key_profile_headers(),
         )
         assert hosted_resp.status_code == 200, hosted_resp.text
     finally:
@@ -453,7 +489,7 @@ def test_oauth_provider_paths_accept_asqend_server_key_without_dashboard_token(m
 
 def test_codex_oauth_status_echoes_asqend_profile_scope():
     """Hosted Asqend callers need profile proof, not process-global status."""
-    resp = client.get("/api/providers/oauth", headers=ASQEND_PROFILE_HEADERS)
+    resp = client.get("/api/providers/oauth", headers=_asqend_profile_headers())
     assert resp.status_code == 200, resp.text
 
     providers = {p["id"]: p for p in resp.json()["providers"]}
@@ -463,6 +499,84 @@ def test_codex_oauth_status_echoes_asqend_profile_scope():
     assert codex["runtime_session_ref"] == "settings-runtime-session"
     assert codex["status"]["profile_ref"] == "hermes-profile:settings"
     assert codex["status"]["runtime_session_ref"] == "settings-runtime-session"
+
+
+def test_oauth_routes_echo_process_start_asqend_identity(monkeypatch):
+    """Catalog/start/poll/cancel must prove which org container served OAuth."""
+    ws, local_client, local_headers = _reload_web_server_with_asqend_identity(monkeypatch)
+
+    async def fake_start_device_code_flow(provider_id, profile_context=None):
+        sid, sess = ws._new_oauth_session(provider_id, "device_code", profile_context)
+        sess["user_code"] = "CODEX-IDENTITY"
+        return {
+            "session_id": sid,
+            "flow": "device_code",
+            "user_code": "CODEX-IDENTITY",
+            "verification_url": "https://example.invalid/device",
+            "expires_in": 600,
+            "poll_interval": 5,
+        }
+
+    monkeypatch.setattr(ws, "_start_device_code_flow", fake_start_device_code_flow)
+    try:
+        catalog = local_client.get("/api/providers/oauth", headers=local_headers)
+        assert catalog.status_code == 200, catalog.text
+        assert catalog.json()["asqend_identity"] == {
+            "org_id": "org-oauth-a",
+            "container_ref": "container-oauth-a",
+            "surface": "dashboard_oauth",
+            "source": "process_env",
+            "version": catalog.json()["asqend_identity"]["version"],
+        }
+
+        start = local_client.post(
+            "/api/providers/oauth/openai-codex/start",
+            headers=local_headers,
+        )
+        assert start.status_code == 200, start.text
+        sid = start.json()["session_id"]
+        assert start.json()["asqend_identity"]["org_id"] == "org-oauth-a"
+        assert start.json()["asqend_identity"]["container_ref"] == "container-oauth-a"
+        assert start.json()["asqend_identity"]["surface"] == "dashboard_oauth_start"
+
+        poll = local_client.get(
+            f"/api/providers/oauth/openai-codex/poll/{sid}",
+            headers=local_headers,
+        )
+        assert poll.status_code == 200, poll.text
+        assert poll.json()["asqend_identity"]["surface"] == "dashboard_oauth_poll"
+        assert poll.json()["asqend_identity"]["container_ref"] == "container-oauth-a"
+
+        cancel = local_client.delete(
+            f"/api/providers/oauth/sessions/{sid}",
+            headers=local_headers,
+        )
+        assert cancel.status_code == 200, cancel.text
+        assert cancel.json()["asqend_identity"]["surface"] == "dashboard_oauth_cancel"
+        assert cancel.json()["asqend_identity"]["org_id"] == "org-oauth-a"
+    finally:
+        _reset_web_server_without_asqend_identity(monkeypatch, ws)
+
+
+def test_oauth_identity_headers_without_process_env_are_rejected(monkeypatch):
+    """Asqend expected-identity headers must not be reflected as Hermes identity."""
+    from hermes_cli import web_server as ws
+
+    import hermes_cli.asqend_identity as identity
+    monkeypatch.setattr(identity, "_BOOT_IDENTITY", None)
+    local_client = TestClient(ws.app)
+
+    resp = local_client.get(
+        "/api/providers/oauth",
+        headers={
+            ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN,
+            "x-asqend-org-id": "org-header-only",
+            "x-asqend-hermes-container-ref": "container-header-only",
+        },
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "asqend_identity_missing"
 
 
 def test_codex_oauth_status_does_not_launder_mismatched_profile(monkeypatch):
@@ -484,7 +598,7 @@ def test_codex_oauth_status_does_not_launder_mismatched_profile(monkeypatch):
         },
     )
 
-    resp = client.get("/api/providers/oauth", headers=ASQEND_PROFILE_HEADERS)
+    resp = client.get("/api/providers/oauth", headers=_asqend_profile_headers())
     assert resp.status_code == 200, resp.text
     providers = {p["id"]: p for p in resp.json()["providers"]}
     codex = providers["openai-codex"]
@@ -515,7 +629,7 @@ def test_codex_oauth_status_preserves_matching_logged_in_profile(monkeypatch):
         },
     )
 
-    resp = client.get("/api/providers/oauth", headers=ASQEND_PROFILE_HEADERS)
+    resp = client.get("/api/providers/oauth", headers=_asqend_profile_headers())
     assert resp.status_code == 200, resp.text
     providers = {p["id"]: p for p in resp.json()["providers"]}
     codex = providers["openai-codex"]
@@ -546,7 +660,7 @@ def test_codex_oauth_start_binds_and_echoes_asqend_profile(monkeypatch):
 
     resp = client.post(
         "/api/providers/oauth/openai-codex/start",
-        headers=ASQEND_PROFILE_HEADERS,
+        headers=_asqend_profile_headers(),
         json={"profile": ASQEND_PROFILE_PAYLOAD},
     )
     assert resp.status_code == 200, resp.text
@@ -580,7 +694,7 @@ def test_codex_oauth_start_without_asqend_profile_remains_local_dashboard_compat
 
     monkeypatch.setattr(ws, "_codex_full_login_worker", _fake_codex_worker)
 
-    resp = client.post("/api/providers/oauth/openai-codex/start", headers=HEADERS)
+    resp = client.post("/api/providers/oauth/openai-codex/start", headers=_headers())
     assert resp.status_code == 200, resp.text
     body = resp.json()
     try:
@@ -613,7 +727,7 @@ def test_codex_oauth_poll_rejects_asqend_profile_mismatch():
         resp = client.get(
             f"/api/providers/oauth/openai-codex/poll/{session_id}",
             headers={
-                **ASQEND_PROFILE_HEADERS,
+                **_asqend_profile_headers(),
                 "x-asqend-hermes-profile-ref": "hermes-profile:other",
             },
         )
@@ -643,7 +757,7 @@ def test_codex_oauth_cancel_rejects_asqend_profile_mismatch():
         resp = client.delete(
             f"/api/providers/oauth/sessions/{session_id}",
             headers={
-                **ASQEND_PROFILE_HEADERS,
+                **_asqend_profile_headers(),
                 "x-asqend-hermes-profile-ref": "hermes-profile:other",
             },
         )
@@ -673,7 +787,7 @@ def test_codex_oauth_cancel_echoes_profile_and_verified_no_write():
     try:
         resp = client.delete(
             f"/api/providers/oauth/sessions/{session_id}",
-            headers=ASQEND_PROFILE_HEADERS,
+            headers=_asqend_profile_headers(),
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -708,7 +822,7 @@ def test_codex_oauth_cancel_is_unverified_after_token_write_claim():
     try:
         resp = client.delete(
             f"/api/providers/oauth/sessions/{session_id}",
-            headers=ASQEND_PROFILE_HEADERS,
+            headers=_asqend_profile_headers(),
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -826,7 +940,7 @@ def test_xai_loopback_start_returns_authorize_url(monkeypatch):
     # Don't let the background worker run a real callback wait/exchange.
     monkeypatch.setattr(ws, "_xai_loopback_worker", lambda sid: None)
 
-    resp = client.post("/api/providers/oauth/xai-oauth/start", headers=HEADERS)
+    resp = client.post("/api/providers/oauth/xai-oauth/start", headers=_headers())
     assert resp.status_code == 200, resp.text
     body = resp.json()
     try:
@@ -1018,7 +1132,7 @@ def test_cancel_loopback_session_shuts_down_callback_server():
 
     try:
         resp = client.delete(
-            f"/api/providers/oauth/sessions/{session_id}", headers=HEADERS
+            f"/api/providers/oauth/sessions/{session_id}", headers=_headers()
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["ok"] is True
@@ -1059,7 +1173,7 @@ def test_unknown_pkce_provider_rejected_cleanly():
         ws._OAUTH_PROVIDER_CATALOG = original_catalog + (fake_entry,)
         resp = client.post(
             "/api/providers/oauth/hypothetical-pkce-provider/start",
-            headers=HEADERS,
+            headers=_headers(),
         )
     finally:
         ws._OAUTH_PROVIDER_CATALOG = original_catalog
