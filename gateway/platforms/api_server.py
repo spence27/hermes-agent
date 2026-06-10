@@ -1301,6 +1301,8 @@ class APIServerAdapter(BasePlatformAdapter):
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
         payload["has_tool_config"] = bool(session.get("tool_config"))
+        tool_config = APIServerAdapter._decode_tool_config_value(session.get("tool_config"))
+        payload["tool_config_rev"] = APIServerAdapter._session_tool_config_rev(tool_config)
         return payload
 
     @staticmethod
@@ -1309,7 +1311,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return (safe or "server")[:80]
 
     @classmethod
-    def _session_mcp_server_runtime_name(cls, session_id: str, server_name: str) -> str:
+    def _session_mcp_server_runtime_name(cls, session_id: str, server_name: str, rev: int = 0) -> str:
         """Return a process-global MCP server key that is still session-scoped.
 
         The MCP registry is process-global and idempotent by server name. API
@@ -1318,7 +1320,15 @@ class APIServerAdapter(BasePlatformAdapter):
         two sessions' MCP clients, credentials, and toolsets separated inside the
         one Hermes container.
         """
-        digest = hashlib.sha256(f"{session_id}:{server_name}".encode("utf-8")).hexdigest()[:12]
+        # The tool-config revision is folded into the hash so an updated binding
+        # (for example a rotated credential) registers fresh clients instead of
+        # silently reusing stale connections; rev 0 preserves the original naming.
+        source = (
+            f"{session_id}:{server_name}"
+            if rev <= 0
+            else f"{session_id}:{server_name}:r{rev}"
+        )
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
         return f"api_{digest}_{cls._safe_mcp_runtime_component(server_name)}"
 
     @staticmethod
@@ -1381,11 +1391,20 @@ class APIServerAdapter(BasePlatformAdapter):
         cls,
         session_id: str,
         mcp_servers: Dict[str, Dict[str, Any]],
+        rev: int = 0,
     ) -> Dict[str, Dict[str, Any]]:
         return {
-            cls._session_mcp_server_runtime_name(session_id, name): dict(config)
+            cls._session_mcp_server_runtime_name(session_id, name, rev): dict(config)
             for name, config in mcp_servers.items()
         }
+
+    @staticmethod
+    def _session_tool_config_rev(tool_config: Dict[str, Any]) -> int:
+        try:
+            rev = int(tool_config.get("rev", 0))
+        except (TypeError, ValueError):
+            return 0
+        return rev if rev > 0 else 0
 
     def _session_mcp_toolsets(self, session_id: Optional[str]) -> List[str]:
         if not session_id:
@@ -1411,7 +1430,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if not mcp_servers:
             return []
 
-        runtime_servers = self._runtime_session_mcp_servers(session_id, mcp_servers)
+        runtime_servers = self._runtime_session_mcp_servers(
+            session_id, mcp_servers, self._session_tool_config_rev(tool_config)
+        )
         enabled_runtime_names = [
             name for name, config in runtime_servers.items() if self._mcp_server_enabled(config)
         ]
@@ -1602,12 +1623,26 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        allowed = {"title", "end_reason"}
+        allowed = {"title", "end_reason", "mcp_servers"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
 
         db = self._ensure_session_db()
+        if "mcp_servers" in body:
+            # Re-bind the session's MCP servers in place (for example after a
+            # credential rotation). The revision is bumped so runtime server
+            # names change and fresh MCP clients register; stale clients keep
+            # their namespaced registrations but are never bound to this
+            # session's agents again. An empty mapping clears the tool config.
+            try:
+                tool_config = self._session_tool_config_from_body(body)
+            except ValueError as exc:
+                return web.json_response(_openai_error(str(exc), code="invalid_mcp_servers"), status=400)
+            if tool_config:
+                current = self._decode_tool_config_value(session.get("tool_config"))
+                tool_config["rev"] = self._session_tool_config_rev(current) + 1
+            db.update_session_tool_config(session_id, tool_config)
         if "title" in body:
             try:
                 db.set_session_title(session_id, "" if body["title"] is None else str(body["title"]))

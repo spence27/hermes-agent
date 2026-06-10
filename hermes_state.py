@@ -1120,6 +1120,25 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def update_session_tool_config(self, session_id: str, tool_config: Dict[str, Any] = None) -> bool:
+        """Replace a session's tool config (API-server session MCP binding).
+
+        Used by the API server's PATCH endpoint so credential rotation can
+        re-bind a session's MCP servers without deleting the session. Passing
+        ``None`` clears the tool config. Returns False when the session does
+        not exist.
+        """
+        if not self.get_session(session_id):
+            return False
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET tool_config = ? WHERE id = ?",
+                (json.dumps(tool_config) if tool_config else None, session_id),
+            )
+        self._execute_write(_do)
+        return True
+
     def update_session_model(self, session_id: str, model: str) -> None:
         """Update the model for a session after a mid-session switch.
 

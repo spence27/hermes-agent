@@ -157,6 +157,94 @@ async def test_session_create_persists_mcp_servers_without_echoing_config(adapte
 
 
 @pytest.mark.asyncio
+async def test_patch_session_rebinds_mcp_servers_and_bumps_rev(adapter, session_db):
+    app = _create_session_app(adapter)
+    original = {
+        "email_ops": {
+            "url": "https://email.example/mcp",
+            "headers": {"Authorization": "Bearer original-token"},
+        }
+    }
+    rotated = {
+        "email_ops": {
+            "url": "https://email.example/mcp",
+            "headers": {"Authorization": "Bearer rotated-token"},
+        }
+    }
+
+    async with TestClient(TestServer(app)) as cli:
+        create_resp = await cli.post(
+            "/api/sessions",
+            json={"id": "rotate-session", "model": "test-model", "mcp_servers": original},
+        )
+        assert create_resp.status == 201
+        created = await create_resp.json()
+        assert created["session"]["tool_config_rev"] == 0
+
+        patch_resp = await cli.patch(
+            "/api/sessions/rotate-session", json={"mcp_servers": rotated}
+        )
+        assert patch_resp.status == 200
+        patched = await patch_resp.json()
+
+    assert patched["session"]["has_tool_config"] is True
+    assert patched["session"]["tool_config_rev"] == 1
+    assert "tool_config" not in patched["session"]
+    persisted = json.loads(session_db.get_session("rotate-session")["tool_config"])
+    assert persisted == {"mcp_servers": rotated, "rev": 1}
+
+    # Revision changes the runtime server identity, so fresh MCP clients
+    # register for the rotated credential instead of reusing stale ones.
+    rev0 = APIServerAdapter._session_mcp_server_runtime_name("rotate-session", "email_ops")
+    rev1 = APIServerAdapter._session_mcp_server_runtime_name("rotate-session", "email_ops", rev=1)
+    assert rev0 != rev1
+    runtime = APIServerAdapter._runtime_session_mcp_servers("rotate-session", rotated, rev=1)
+    assert set(runtime) == {rev1}
+
+
+@pytest.mark.asyncio
+async def test_patch_session_rejects_invalid_mcp_servers(adapter, session_db):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        create_resp = await cli.post(
+            "/api/sessions", json={"id": "invalid-session", "model": "test-model"}
+        )
+        assert create_resp.status == 201
+
+        patch_resp = await cli.patch(
+            "/api/sessions/invalid-session", json={"mcp_servers": ["not-a-mapping"]}
+        )
+        assert patch_resp.status == 400
+        body = await patch_resp.json()
+
+    assert body["error"]["code"] == "invalid_mcp_servers"
+    assert session_db.get_session("invalid-session")["tool_config"] is None
+
+
+@pytest.mark.asyncio
+async def test_patch_session_clears_mcp_servers_with_empty_mapping(adapter, session_db):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        create_resp = await cli.post(
+            "/api/sessions",
+            json={
+                "id": "clear-session",
+                "model": "test-model",
+                "mcp_servers": {"email_ops": {"url": "https://email.example/mcp"}},
+            },
+        )
+        assert create_resp.status == 201
+
+        patch_resp = await cli.patch("/api/sessions/clear-session", json={"mcp_servers": {}})
+        assert patch_resp.status == 200
+        patched = await patch_resp.json()
+
+    assert patched["session"]["has_tool_config"] is False
+    assert patched["session"]["tool_config_rev"] == 0
+    assert session_db.get_session("clear-session")["tool_config"] is None
+
+
+@pytest.mark.asyncio
 async def test_api_sessions_register_real_mcp_tools_without_cross_session_bleed(adapter, session_db, tmp_path):
     """Two API sessions can reuse one logical MCP name with isolated live tool surfaces."""
     from gateway.platforms.api_server import APIServerAdapter
