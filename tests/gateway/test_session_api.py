@@ -1,5 +1,9 @@
 """Focused tests for API server session-control endpoints."""
 
+import asyncio
+import json
+import sys
+import textwrap
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -122,8 +126,161 @@ async def test_session_crud_and_message_history(adapter, session_db):
 
 
 @pytest.mark.asyncio
+async def test_session_create_persists_mcp_servers_without_echoing_config(adapter, session_db):
+    app = _create_session_app(adapter)
+    mcp_servers = {
+        "email_ops": {
+            "url": "https://email.example/mcp",
+            "headers": {"Authorization": "Bearer email-token"},
+        }
+    }
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/sessions",
+            json={
+                "id": "email-session",
+                "title": "Email Ops",
+                "model": "test-model",
+                "mcp_servers": mcp_servers,
+            },
+        )
+        assert resp.status == 201
+        payload = await resp.json()
+
+    assert payload["session"]["id"] == "email-session"
+    assert payload["session"]["has_tool_config"] is True
+    assert "tool_config" not in payload["session"]
+
+    persisted = session_db.get_session("email-session")
+    assert json.loads(persisted["tool_config"]) == {"mcp_servers": mcp_servers}
+
+
+@pytest.mark.asyncio
+async def test_api_sessions_register_real_mcp_tools_without_cross_session_bleed(adapter, session_db, tmp_path):
+    """Two API sessions can reuse one logical MCP name with isolated live tool surfaces."""
+    from gateway.platforms.api_server import APIServerAdapter
+    from tools.mcp_tool import sanitize_mcp_name_component, shutdown_mcp_servers
+    from tools.registry import registry
+
+    server_script = tmp_path / "session_probe_mcp.py"
+    server_script.write_text(
+        textwrap.dedent(
+            """
+            import os
+
+            from mcp.server.fastmcp import FastMCP
+
+            app = FastMCP("session-probe")
+
+
+            @app.tool(name="session_identity", description="Return this MCP server's session marker.")
+            def session_identity() -> str:
+                return f"{os.environ['SESSION_MARKER']}:{os.environ['SESSION_TOKEN']}"
+
+
+            if __name__ == "__main__":
+                app.run()
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def mcp_servers(marker: str) -> dict:
+        return {
+            "asqend": {
+                "command": sys.executable,
+                "args": [str(server_script)],
+                "env": {
+                    "SESSION_MARKER": marker,
+                    "SESSION_TOKEN": f"{marker}-token",
+                },
+                "connect_timeout": 10,
+                "tool_timeout": 10,
+                "tools": {"resources": False, "prompts": False},
+            }
+        }
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        email_resp = await cli.post(
+            "/api/sessions",
+            json={"id": "email-session", "mcp_servers": mcp_servers("email")},
+        )
+        social_resp = await cli.post(
+            "/api/sessions",
+            json={"id": "social-session", "mcp_servers": mcp_servers("social")},
+        )
+        assert email_resp.status == 201
+        assert social_resp.status == 201
+
+    runtime_email = APIServerAdapter._session_mcp_server_runtime_name("email-session", "asqend")
+    runtime_social = APIServerAdapter._session_mcp_server_runtime_name("social-session", "asqend")
+    email_tool = f"mcp_{sanitize_mcp_name_component(runtime_email)}_session_identity"
+    social_tool = f"mcp_{sanitize_mcp_name_component(runtime_social)}_session_identity"
+
+    try:
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model") as mock_model, \
+             patch("gateway.run._load_gateway_config") as mock_config, \
+             patch("gateway.run.GatewayRunner._load_reasoning_config", return_value=None), \
+             patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None), \
+             patch("tools.osv_check.check_package_for_malware", return_value=None):
+
+            mock_kwargs.return_value = {
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "custom",
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            }
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {"platform_toolsets": {"api_server": ["web", "no_mcp"]}}
+
+            email_agent, social_agent = await asyncio.gather(
+                asyncio.to_thread(adapter._create_agent, session_id="email-session"),
+                asyncio.to_thread(adapter._create_agent, session_id="social-session"),
+            )
+
+        assert runtime_email != runtime_social
+        assert f"mcp-{runtime_email}" in email_agent.enabled_toolsets
+        assert f"mcp-{runtime_social}" not in email_agent.enabled_toolsets
+        assert f"mcp-{runtime_social}" in social_agent.enabled_toolsets
+        assert f"mcp-{runtime_email}" not in social_agent.enabled_toolsets
+        assert "mcp-asqend" not in email_agent.enabled_toolsets
+        assert "mcp-asqend" not in social_agent.enabled_toolsets
+
+        assert email_tool in email_agent.valid_tool_names
+        assert social_tool not in email_agent.valid_tool_names
+        assert social_tool in social_agent.valid_tool_names
+        assert email_tool not in social_agent.valid_tool_names
+
+        email_result = json.loads(registry.dispatch(email_tool, {}))
+        social_result = json.loads(registry.dispatch(social_tool, {}))
+        assert email_result["result"] == "email:email-token"
+        assert social_result["result"] == "social:social-token"
+    finally:
+        shutdown_mcp_servers()
+
+
+@pytest.mark.asyncio
 async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, session_db):
-    source_id = session_db.create_session("source-session", "api_server", model="test-model")
+    tool_config = {
+        "mcp_servers": {
+            "asqend": {
+                "url": "https://email.example/mcp",
+                "headers": {"Authorization": "Bearer email-token"},
+            }
+        }
+    }
+    source_id = session_db.create_session(
+        "source-session",
+        "api_server",
+        model="test-model",
+        tool_config=tool_config,
+    )
     session_db.set_session_title(source_id, "Original")
     session_db.append_message(source_id, "user", "first path")
     session_db.append_message(source_id, "assistant", "answer")
@@ -139,6 +296,9 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     assert fork["id"] != source_id
     assert fork["parent_session_id"] == source_id
     assert fork["title"] == "Alternative"
+    assert fork["has_tool_config"] is True
+    assert "tool_config" not in fork
+    assert json.loads(session_db.get_session(fork["id"])["tool_config"]) == tool_config
     assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
     assert session_db.get_session(source_id)["end_reason"] == "branched"
 

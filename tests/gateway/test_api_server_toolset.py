@@ -1,5 +1,8 @@
 """Tests for hermes-api-server toolset and API server tool availability."""
+import json
 from unittest.mock import patch, MagicMock
+
+import pytest
 
 
 from toolsets import resolve_toolset, get_toolset, validate_toolset
@@ -124,3 +127,176 @@ class TestApiServerAdapterToolset:
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
             assert sorted(toolsets) == ["terminal", "web"]
+
+
+class TestApiServerSessionMcpToolsets:
+    @staticmethod
+    def _runtime_server_name(session_id, server_name):
+        from gateway.platforms.api_server import APIServerAdapter
+
+        return APIServerAdapter._session_mcp_server_runtime_name(session_id, server_name)
+
+    @staticmethod
+    def _session(mcp_servers):
+        return {
+            "id": "session",
+            "source": "api_server",
+            "tool_config": json.dumps({"mcp_servers": mcp_servers}),
+        }
+
+    @staticmethod
+    def _patch_agent_runtime():
+        return (
+            patch("gateway.run._resolve_runtime_agent_kwargs"),
+            patch("gateway.run._resolve_gateway_model"),
+            patch("gateway.run._load_gateway_config"),
+            patch("run_agent.AIAgent"),
+            patch("tools.mcp_tool.register_mcp_servers"),
+        )
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_registers_session_mcp_servers(self):
+        """API-server sessions can attach their own MCP servers without config.yaml edits."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        class _FakeDB:
+            def get_session(self, session_id):
+                assert session_id == "email-session"
+                return TestApiServerSessionMcpToolsets._session(
+                    {
+                        "email_ops": {
+                            "url": "https://email.example/mcp",
+                            "headers": {"Authorization": "Bearer email-token"},
+                        }
+                    }
+                )
+
+        adapter = APIServerAdapter(PlatformConfig())
+        adapter._session_db = _FakeDB()
+        m_kwargs, m_model, m_config, m_agent_cls, m_register = self._patch_agent_runtime()
+        with m_kwargs as mock_kwargs, m_model as mock_model, m_config as mock_config, \
+             m_agent_cls as mock_agent_cls, m_register as mock_register:
+
+            mock_kwargs.return_value = {"api_key": "test-key", "base_url": None,
+                                        "provider": None, "api_mode": None,
+                                        "command": None, "args": []}
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {"platform_toolsets": {"api_server": ["web"]}}
+            mock_agent_cls.return_value = MagicMock()
+            runtime_name = self._runtime_server_name("email-session", "email_ops")
+            mock_register.return_value = [f"mcp_{runtime_name}_session_identity"]
+
+            adapter._create_agent(session_id="email-session")
+
+        mock_register.assert_called_once_with(
+            {
+                runtime_name: {
+                    "url": "https://email.example/mcp",
+                    "headers": {"Authorization": "Bearer email-token"},
+                }
+            }
+        )
+        toolsets = mock_agent_cls.call_args.kwargs["enabled_toolsets"]
+        assert toolsets == [f"mcp-{runtime_name}", "web"]
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_namespaces_same_mcp_server_per_session(self):
+        """Concurrent API-server sessions can reuse logical MCP names with different keys."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        class _FakeDB:
+            sessions = {
+                "email-session": TestApiServerSessionMcpToolsets._session(
+                    {
+                        "asqend": {
+                            "url": "https://email.example/mcp",
+                            "headers": {"Authorization": "Bearer email-token"},
+                        }
+                    }
+                ),
+                "social-session": TestApiServerSessionMcpToolsets._session(
+                    {
+                        "asqend": {
+                            "url": "https://social.example/mcp",
+                            "headers": {"Authorization": "Bearer social-token"},
+                        }
+                    }
+                ),
+            }
+
+            def get_session(self, session_id):
+                return self.sessions.get(session_id)
+
+        adapter = APIServerAdapter(PlatformConfig())
+        adapter._session_db = _FakeDB()
+        m_kwargs, m_model, m_config, m_agent_cls, m_register = self._patch_agent_runtime()
+        with m_kwargs as mock_kwargs, m_model as mock_model, m_config as mock_config, \
+             m_agent_cls as mock_agent_cls, m_register as mock_register:
+
+            mock_kwargs.return_value = {"api_key": "test-key", "base_url": None,
+                                        "provider": None, "api_mode": None,
+                                        "command": None, "args": []}
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {"platform_toolsets": {"api_server": ["web"]}}
+            mock_agent_cls.return_value = MagicMock()
+            email_runtime_name = self._runtime_server_name("email-session", "asqend")
+            social_runtime_name = self._runtime_server_name("social-session", "asqend")
+            mock_register.side_effect = [
+                [f"mcp_{email_runtime_name}_session_identity"],
+                [
+                    f"mcp_{email_runtime_name}_session_identity",
+                    f"mcp_{social_runtime_name}_session_identity",
+                ],
+            ]
+
+            adapter._create_agent(session_id="email-session")
+            adapter._create_agent(session_id="social-session")
+
+        first_toolsets = mock_agent_cls.call_args_list[0].kwargs["enabled_toolsets"]
+        second_toolsets = mock_agent_cls.call_args_list[1].kwargs["enabled_toolsets"]
+
+        assert email_runtime_name != social_runtime_name
+        assert first_toolsets == [f"mcp-{email_runtime_name}", "web"]
+        assert f"mcp-{social_runtime_name}" not in first_toolsets
+        assert second_toolsets == [f"mcp-{social_runtime_name}", "web"]
+        assert f"mcp-{email_runtime_name}" not in second_toolsets
+        assert mock_register.call_args_list[0].args[0][email_runtime_name]["headers"] == {
+            "Authorization": "Bearer email-token"
+        }
+        assert mock_register.call_args_list[1].args[0][social_runtime_name]["headers"] == {
+            "Authorization": "Bearer social-token"
+        }
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_fails_closed_when_session_mcp_does_not_register_toolset(self):
+        """A session with required MCP config must not silently run without those tools."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        class _FakeDB:
+            def get_session(self, session_id):
+                assert session_id == "email-session"
+                return TestApiServerSessionMcpToolsets._session(
+                    {"asqend": {"url": "https://email.example/mcp"}}
+                )
+
+        adapter = APIServerAdapter(PlatformConfig())
+        adapter._session_db = _FakeDB()
+        m_kwargs, m_model, m_config, m_agent_cls, m_register = self._patch_agent_runtime()
+        with m_kwargs as mock_kwargs, m_model as mock_model, m_config as mock_config, \
+             m_agent_cls as mock_agent_cls, m_register as mock_register:
+
+            mock_kwargs.return_value = {"api_key": "test-key", "base_url": None,
+                                        "provider": None, "api_mode": None,
+                                        "command": None, "args": []}
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {"platform_toolsets": {"api_server": ["web"]}}
+            mock_agent_cls.return_value = MagicMock()
+            mock_register.return_value = []
+
+            with pytest.raises(RuntimeError, match="required session MCP servers"):
+                adapter._create_agent(session_id="email-session")
+
+        mock_agent_cls.assert_not_called()

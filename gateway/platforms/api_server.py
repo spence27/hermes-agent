@@ -74,6 +74,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+_SESSION_MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1003,7 +1004,10 @@ class APIServerAdapter(BasePlatformAdapter):
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = sorted(
+            set(_get_platform_tools(user_config, "api_server"))
+            | set(self._session_mcp_toolsets(session_id))
+        )
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -1296,7 +1300,147 @@ class APIServerAdapter(BasePlatformAdapter):
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        payload["has_tool_config"] = bool(session.get("tool_config"))
         return payload
+
+    @staticmethod
+    def _safe_mcp_runtime_component(value: Any) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_]", "_", str(value or "").strip()).strip("_")
+        return (safe or "server")[:80]
+
+    @classmethod
+    def _session_mcp_server_runtime_name(cls, session_id: str, server_name: str) -> str:
+        """Return a process-global MCP server key that is still session-scoped.
+
+        The MCP registry is process-global and idempotent by server name. API
+        sessions therefore cannot register raw names like ``asqend`` when each
+        session may have a different token. Prefixing a stable session hash keeps
+        two sessions' MCP clients, credentials, and toolsets separated inside the
+        one Hermes container.
+        """
+        digest = hashlib.sha256(f"{session_id}:{server_name}".encode("utf-8")).hexdigest()[:12]
+        return f"api_{digest}_{cls._safe_mcp_runtime_component(server_name)}"
+
+    @staticmethod
+    def _mcp_server_enabled(config: Dict[str, Any]) -> bool:
+        value = config.get("enabled", True)
+        if value is None:
+            return True
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return _coerce_request_bool(value, default=True)
+        return bool(value)
+
+    @staticmethod
+    def _decode_tool_config_value(value: Any) -> Dict[str, Any]:
+        if not value:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                logger.warning("Ignoring invalid API-server session tool_config JSON")
+                return {}
+            return decoded if isinstance(decoded, dict) else {}
+        return {}
+
+    @staticmethod
+    def _normalize_session_mcp_servers(value: Any) -> Dict[str, Dict[str, Any]]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("mcp_servers must be a JSON object")
+
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for raw_name, raw_config in value.items():
+            name = str(raw_name or "").strip()
+            if not name or not _SESSION_MCP_SERVER_NAME_RE.fullmatch(name):
+                raise ValueError(
+                    "mcp_servers keys must use 1-80 characters from A-Z, a-z, 0-9, _, or -"
+                )
+            if not isinstance(raw_config, dict):
+                raise ValueError(f"mcp_servers.{name} must be a JSON object")
+            try:
+                normalized[name] = json.loads(json.dumps(raw_config))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"mcp_servers.{name} must be JSON serializable") from exc
+        return normalized
+
+    @classmethod
+    def _session_tool_config_from_body(cls, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if "mcp_servers" not in body:
+            return None
+        mcp_servers = cls._normalize_session_mcp_servers(body.get("mcp_servers"))
+        return {"mcp_servers": mcp_servers} if mcp_servers else None
+
+    @classmethod
+    def _runtime_session_mcp_servers(
+        cls,
+        session_id: str,
+        mcp_servers: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        return {
+            cls._session_mcp_server_runtime_name(session_id, name): dict(config)
+            for name, config in mcp_servers.items()
+        }
+
+    def _session_mcp_toolsets(self, session_id: Optional[str]) -> List[str]:
+        if not session_id:
+            return []
+
+        db = self._ensure_session_db()
+        if db is None:
+            return []
+        try:
+            session = db.get_session(session_id)
+        except Exception:
+            logger.warning("Session %s: failed to load API-server session tool config", session_id, exc_info=True)
+            return []
+        if not session:
+            return []
+
+        tool_config = self._decode_tool_config_value(session.get("tool_config"))
+        try:
+            mcp_servers = self._normalize_session_mcp_servers(tool_config.get("mcp_servers"))
+        except ValueError:
+            logger.warning("Session %s: invalid API-server session MCP config", session_id, exc_info=True)
+            return []
+        if not mcp_servers:
+            return []
+
+        runtime_servers = self._runtime_session_mcp_servers(session_id, mcp_servers)
+        enabled_runtime_names = [
+            name for name, config in runtime_servers.items() if self._mcp_server_enabled(config)
+        ]
+        if not enabled_runtime_names:
+            return []
+
+        try:
+            from tools.mcp_tool import register_mcp_servers, sanitize_mcp_name_component
+
+            registered_tool_names = register_mcp_servers(runtime_servers)
+        except Exception as exc:
+            logger.warning("Session %s: failed to register API-server MCP servers", session_id, exc_info=True)
+            raise RuntimeError(
+                f"Session {session_id}: failed to register required session MCP servers"
+            ) from exc
+
+        missing_runtime_names = []
+        registered_names = {str(name) for name in registered_tool_names or []}
+        for runtime_name in enabled_runtime_names:
+            tool_prefix = f"mcp_{sanitize_mcp_name_component(runtime_name)}_"
+            if not any(name.startswith(tool_prefix) for name in registered_names):
+                missing_runtime_names.append(runtime_name)
+        if missing_runtime_names:
+            raise RuntimeError(
+                f"Session {session_id}: required session MCP servers did not register tools: "
+                f"{', '.join(missing_runtime_names)}"
+            )
+
+        return [f"mcp-{name}" for name in enabled_runtime_names]
 
     @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -1401,7 +1545,17 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
-        db.create_session(session_id, "api_server", model=str(model) if model else None, system_prompt=system_prompt)
+        try:
+            tool_config = self._session_tool_config_from_body(body)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_mcp_servers"), status=400)
+        create_kwargs = {
+            "model": str(model) if model else None,
+            "system_prompt": system_prompt,
+        }
+        if tool_config:
+            create_kwargs["tool_config"] = tool_config
+        db.create_session(session_id, "api_server", **create_kwargs)
         title = body.get("title")
         if title is not None:
             try:
@@ -1518,12 +1672,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # SessionDB's native parent_session_id/end_reason visibility model rather
         # than inventing a parallel fork store.
         db.end_session(source_id, "branched")
+        source_tool_config = self._decode_tool_config_value(source.get("tool_config"))
+        create_kwargs = {
+            "model": source.get("model"),
+            "system_prompt": source.get("system_prompt"),
+            "parent_session_id": source_id,
+        }
+        if source_tool_config:
+            create_kwargs["tool_config"] = source_tool_config
         db.create_session(
             fork_id,
             "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
+            **create_kwargs,
         )
         messages = db.get_messages(source_id)
         db.replace_messages(fork_id, messages)
